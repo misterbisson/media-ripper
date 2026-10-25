@@ -86,15 +86,38 @@ def safe_filename(name):
 
 # ---------------------------------------------------------------- scanning
 
+def disc_regions(disc):
+    """Regions the disc plays in. Byte 0x23 of VIDEO_TS.IFO has a bit set for each
+    region it's barred from."""
+    try:
+        mask = (Path(disc) / "VIDEO_TS" / "VIDEO_TS.IFO").read_bytes()[0x23]
+    except (OSError, IndexError):
+        return []
+    return [r for r in range(1, 9) if not mask & 1 << (r - 1)]
+
+
 def scan(disc):
     print(f"Scanning {disc} …", flush=True)
+    # libdvdcss logs the drive's region only when verbose.
     proc = subprocess.run(
         [HANDBRAKE, "-i", str(disc), "-t", "0", "--scan", "--json"],
-        capture_output=True, text=True)
+        capture_output=True, text=True, env={**os.environ, "DVDCSS_VERBOSE": "2"})
     marker = "JSON Title Set:"
     idx = proc.stdout.find(marker)
     if idx < 0:
-        sys.exit(f"Scan failed (is libdvdcss installed?):\n{proc.stderr[-2000:]}")
+        drive = re.search(r"drive region\(s\) (\d)", proc.stderr)
+        regions = disc_regions(disc)
+        if drive and regions and int(drive[1]) not in regions:
+            # libdvdcss cached blank keys for this disc; they'd spoil a later rip.
+            cache = re.search(r"key cache dir: (\S+\.dvdcss/[^/\s]+)/", proc.stderr)
+            if cache:
+                shutil.rmtree(cache[1], ignore_errors=True)
+            sys.exit(f"This disc is for region {' and '.join(map(str, regions))} and the "
+                     f"drive is set to region {drive[1]}, so the drive won't read it. Use a "
+                     "drive set to the disc's region, or change this one's (macOS's DVD "
+                     "Player offers to; drives allow only 5 changes).")
+        errors = [l for l in proc.stderr.splitlines() if "dvdcss debug" not in l]
+        sys.exit("Scan failed (is libdvdcss installed?):\n" + "\n".join(errors[-30:]))
     data, _ = json.JSONDecoder().raw_decode(proc.stdout[idx + len(marker):].lstrip())
     return data
 
