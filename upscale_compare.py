@@ -95,18 +95,27 @@ def lanczos(frames):
         yield f, 0.0
 
 
-def torch_model(weights, blend_with=None, blend=0.5):
+def load_model(weights, blend_with=None, blend=1.0):
+    """A PyTorch model from weights, optionally interpolated with a second set.
+
+    That interpolation is Real-ESRGAN's "denoise strength" (-dn): general-x4v3 and
+    its weak-denoise twin share an architecture, so blend * x4v3 + (1 - blend) * wdn
+    is a model in between, not a crossfade of two outputs.
+    """
+    import spandrel
+    model = spandrel.ModelLoader().load_from_file(MODELS / weights).model
+    if blend_with:
+        other = spandrel.ModelLoader().load_from_file(MODELS / blend_with).model.state_dict()
+        sd = model.state_dict()
+        model.load_state_dict({k: blend * v + (1 - blend) * other[k] for k, v in sd.items()})
+    return model
+
+
+def torch_model(weights, blend_with=None, blend=1.0):
     def run(frames):
-        import spandrel
         import torch
         dev = torch.device("mps")
-        desc = spandrel.ModelLoader().load_from_file(MODELS / weights)
-        if blend_with:
-            # Real-ESRGAN's "denoise strength": interpolate two models' weights
-            other = spandrel.ModelLoader().load_from_file(MODELS / blend_with).model.state_dict()
-            sd = desc.model.state_dict()
-            desc.model.load_state_dict({k: blend * v + (1 - blend) * other[k] for k, v in sd.items()})
-        net = desc.model.to(dev).eval().half()
+        net = load_model(weights, blend_with, blend).to(dev).eval().half()
         with torch.inference_mode():
             for f in frames:
                 t0 = time.perf_counter()
@@ -141,17 +150,21 @@ def tile_spans(size, tile, overlap):
     return [(s, edges[i], edges[i + 1]) for i, s in enumerate(starts)]
 
 
-def coreml_model(package, compute="ALL", tile=256, scale=4, overlap=32):
+def coreml_model(package, compute="ALL", overlap=32):
+    """A Core ML model with a fixed input size, tiled across the frame if smaller."""
     def run(frames):
         import coremltools as ct
         model = ct.models.MLModel(str(MODELS / "coreml" / package),
                                   compute_units=getattr(ct.ComputeUnit, compute))
+        spec = model.get_spec().description
+        th, tw = spec.input[0].type.multiArrayType.shape[2:]
+        scale = spec.output[0].type.multiArrayType.shape[2] // th
         h, w = frames[0].shape[:2]
-        ys, xs = tile_spans(h, tile, overlap), tile_spans(w, tile, overlap)
+        ys, xs = tile_spans(h, th, overlap), tile_spans(w, tw, overlap)
         for f in frames:
             t0 = time.perf_counter()
             x = (f.astype(np.float16) / 255).transpose(2, 0, 1)[None]
-            batch = [{"input": x[:, :, y:y + tile, xx:xx + tile]} for y, _, _ in ys for xx, _, _ in xs]
+            batch = [{"input": x[:, :, y:y + th, xx:xx + tw]} for y, _, _ in ys for xx, _, _ in xs]
             outs = iter(model.predict(batch))
             y_out = np.empty((h * scale, w * scale, 3), np.uint8)
             for y, ylo, yhi in ys:
@@ -164,12 +177,58 @@ def coreml_model(package, compute="ALL", tile=256, scale=4, overlap=32):
     return run
 
 
+def coreml_general(denoise):
+    """general-x4v3 at a denoise strength, converted to Core ML at the clip's frame
+    size. Whole frames run about twice as fast on the Neural Engine as 256px tiles."""
+    def run(frames):
+        h, w = frames[0].shape[:2]
+        package = MODELS / "coreml" / f"general-x4v3-dn{round(denoise * 100)}-{w}x{h}.mlpackage"
+        if not package.exists():
+            import coremltools as ct
+            import torch
+            net = load_model("realesr-general-x4v3.pth", "realesr-general-wdn-x4v3.pth",
+                             denoise).float().eval()
+            traced = torch.jit.trace(net, torch.rand(1, 3, h, w))
+            ct.convert(traced, convert_to="mlprogram", compute_precision=ct.precision.FLOAT16,
+                       inputs=[ct.TensorType(name="input", shape=(1, 3, h, w), dtype=np.float16)],
+                       outputs=[ct.TensorType(name="output", dtype=np.float16)],
+                       minimum_deployment_target=ct.target.macOS15).save(str(package))
+        yield from coreml_model(package)(frames)
+    return run
+
+
+def with_grain(inner, amount, size=0.8):
+    """Add luma grain at the final 1920x1080, as when finishing an upscaled still.
+
+    `amount` is the grain's standard deviation in 8-bit code values at midtones,
+    tapering to a quarter of that in deep shadows and highlights. `size` is the
+    blur applied to the noise, in output pixels, so it reads as grain, not static.
+    The grain is seeded by frame number, so every method gets the same grain.
+    """
+    def run(frames):
+        import torch
+        from PIL import Image
+        from torchvision.transforms.functional import gaussian_blur
+        kernel = 2 * int(np.ceil(3 * size)) + 1
+        for i, (frame, secs) in enumerate(inner(frames)):
+            t0 = time.perf_counter()
+            img = np.asarray(Image.fromarray(frame).resize((OUT_W, OUT_H), Image.LANCZOS), np.float32)
+            noise = torch.randn(1, 1, OUT_H, OUT_W, generator=torch.Generator().manual_seed(i))
+            noise = gaussian_blur(noise, kernel, size)
+            noise = (noise / noise.std())[0, 0].numpy()
+            luma = img @ np.array([0.2126, 0.7152, 0.0722], np.float32) / 255
+            weight = np.clip(4 * luma * (1 - luma), 0.25, 1)
+            out = img + (amount * noise * weight)[..., None]
+            yield np.clip(out, 0, 255).round().astype(np.uint8), secs + time.perf_counter() - t0
+    return run
+
+
 METHODS = {
     "lanczos": ("Lanczos (no ML)", "ffmpeg", lanczos),
     "torch-general": ("Real-ESRGAN general x4v3", "PyTorch · GPU",
                       torch_model("realesr-general-x4v3.pth")),
-    "torch-general-grain": ("Real-ESRGAN general x4v3, half denoise", "PyTorch · GPU",
-                            torch_model("realesr-general-x4v3.pth", "realesr-general-wdn-x4v3.pth")),
+    "torch-general-dn50": ("Real-ESRGAN general x4v3, denoise 0.5", "PyTorch · GPU",
+                           torch_model("realesr-general-x4v3.pth", "realesr-general-wdn-x4v3.pth", 0.5)),
     "torch-x2plus": ("Real-ESRGAN x2plus", "PyTorch · GPU", torch_model("RealESRGAN_x2plus.pth")),
     "ncnn-animevideo": ("Real-ESRGAN animevideov3 x2", "ncnn · Vulkan",
                         ncnn_model("realesr-animevideov3", 2)),
@@ -179,6 +238,20 @@ METHODS = {
                        coreml_model("RealESRGAN-x4v3.mlpackage")),
     "coreml-x4plus": ("Real-ESRGAN x4plus", "Core ML · Neural Engine",
                       coreml_model("RealESRGAN-x4plus.mlpackage")),
+    "coreml-dn100": ("Real-ESRGAN general x4v3, whole frame", "Core ML · Neural Engine",
+                     coreml_general(1.0)),
+    "coreml-dn50": ("Real-ESRGAN general x4v3, denoise 0.5", "Core ML · Neural Engine",
+                    coreml_general(0.5)),
+    "coreml-dn0": ("Real-ESRGAN general x4v3, denoise 0", "Core ML · Neural Engine",
+                   coreml_general(0.0)),
+    "coreml-dn100-grain1.5": ("Real-ESRGAN general x4v3 + grain 1.5", "Core ML · Neural Engine",
+                              with_grain(coreml_general(1.0), 1.5)),
+    "coreml-dn100-grain3": ("Real-ESRGAN general x4v3 + grain 3", "Core ML · Neural Engine",
+                            with_grain(coreml_general(1.0), 3)),
+    "coreml-dn100-grain5": ("Real-ESRGAN general x4v3 + grain 5", "Core ML · Neural Engine",
+                            with_grain(coreml_general(1.0), 5)),
+    "coreml-dn50-grain3": ("Real-ESRGAN general x4v3, denoise 0.5 + grain 3",
+                           "Core ML · Neural Engine", with_grain(coreml_general(0.5), 3)),
 }
 
 

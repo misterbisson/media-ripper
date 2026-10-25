@@ -113,8 +113,9 @@ Landscapes* (720×480 → 1920×1080):
 
 | Model | Backend | Frames/s | 86-min film |
 |---|---|---|---|
-| general x4v3 | Core ML | 3.9 | ~9 h |
-| general x4v3, half denoise | PyTorch | 2.8 | ~13 h |
+| general x4v3, whole frame (any denoise level) | Core ML | 5.6 | ~6 h |
+| general x4v3, 256 px tiles | Core ML | 3.9 | ~9 h |
+| general x4v3, denoise 0.5 | PyTorch | 2.8 | ~13 h |
 | animevideov3 ×2 | ncnn | 2.7 | ~13 h |
 | general x4v3 | PyTorch | 2.5 | ~14 h |
 | x2plus | PyTorch | 0.7 | ~2 days |
@@ -127,9 +128,33 @@ and 2.5 fps warm. Expect a full film to be at the slow end.
 What the stills show:
 
 - **general x4v3** (fast) cleans DVD noise and gives crisp edges, but it smooths skin
-  towards wax and turns hazy areas painterly. The half-denoise blend keeps a little more
-  texture.
+  towards wax and turns hazy areas painterly. Lower denoise strengths keep more of the
+  source's noise. That suits skin, but in haze it brings back blotchy MPEG-2 noise.
 - **animevideov3** is the smoothest: fine for animation, flat on live action.
 - **x4plus** gives the most convincing faces and edges, and it also invents texture.
   A plain blue object in the e-waste shot comes out speckled.
 - **Lanczos** keeps the grain and invents nothing. It's soft, but nothing in it is false.
+
+**Denoise strength.** general-x4v3 has a weak-denoise twin (`wdn`) with the same
+architecture, so the two sets of weights can be interpolated into an in-between model.
+That's Real-ESRGAN's `-dn` option. The harness converts each blend to Core ML at the full
+frame size, which runs about twice as fast on the Neural Engine as 256 px tiles.
+
+**Added grain.** As with upscaled stills, adding grain at the final 1920×1080 (luma only,
+softened slightly, strongest in the midtones) takes the wax off. Measured in a flat
+patch, the source has about 1.35 code values of grain, and x4v3 leaves 0.67. Adding 3
+looked most like film; 5 looks sandy. Full denoise plus added grain beat lower denoise
+strengths, because the added grain is even where the source's noise is blotchy.
+
+Grain costs bitrate. On the close-up face clip, grain 3 versus none:
+
+| Encode | Grain kept (of 3.06) | Bitrate with grain vs without |
+|---|---|---|
+| x264 CRF 19 | 2.80 | 21.4 vs 8.3 Mbps |
+| x265 CRF 22 | 2.54 | 8.9 vs 4.3 Mbps |
+| SVT-AV1 CRF 30 | 1.43 | 4.2 vs 2.9 Mbps |
+| SVT-AV1 + film-grain synthesis | 1.65 | 3.9 Mbps |
+
+x265 keeps the grain for about twice the bits of a clean picture. AV1 smears half of it
+away, and SVT-AV1's grain synthesis (`film-grain=8:film-grain-denoise=1`; denoising is off
+by default) underestimates grain this fine, so it doesn't bring much back.
