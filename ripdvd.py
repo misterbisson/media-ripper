@@ -14,7 +14,7 @@ Usage:
     ./ripdvd.py                 # rip whatever disc is inserted
     ./ripdvd.py --list          # show titles/tracks and exit
     ./ripdvd.py --loop --eject  # rip, eject, wait for the next disc, repeat
-    ./ripdvd.py --sample 60 --upscale 1080   # 60s test clip to compare settings
+    ./ripdvd.py --sample --upscale 1080   # one chapter, to compare settings
 """
 
 import argparse
@@ -264,10 +264,9 @@ def encode(disc, title, out_path, args):
     else:
         cmd += ["-s", "none"]
     if args.sample:
-        # Seek by chapter: --start-at makes HandBrake read the disc from the top
-        chapter = len(title["ChapterList"]) // 2 + 1
-        cmd += ["-c", f"{chapter}-{len(title['ChapterList'])}",
-                "--stop-at", f"seconds:{args.sample}"]
+        # One whole chapter from the middle. HandBrake ignores -c when given
+        # --start-at or --stop-at, and seeking by time reads the disc from the top.
+        cmd += ["-c", str(len(title["ChapterList"]) // 2 + 1)]
 
     log_path = out_path.with_suffix(".log")
     if args.verbose:
@@ -398,8 +397,8 @@ def main():
                     help="video encoder (default: x264)")
     ap.add_argument("-q", "--quality", type=float, default=19,
                     help="constant quality RF, lower is better (default: 19)")
-    ap.add_argument("--sample", type=int, metavar="SECS",
-                    help="encode only SECS seconds from the middle, for testing")
+    ap.add_argument("--sample", action="store_true",
+                    help="encode only one chapter from the middle, for testing")
     ap.add_argument("--no-metadata", action="store_true",
                     help="skip the Wikidata lookup, .nfo and poster")
     ap.add_argument("--eject", action="store_true", help="eject the disc when done")

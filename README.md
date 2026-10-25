@@ -28,7 +28,7 @@ Python 3.10+ standard library only. Nothing to install.
 ./ripdvd.py --list           # show the disc's titles and tracks, then stop
 ./ripdvd.py -y --eject       # no questions; eject when done
 ./ripdvd.py --loop           # rip, eject, wait for the next disc, repeat
-./ripdvd.py --sample 60 --upscale 1080   # a 60 s clip to try settings on
+./ripdvd.py --sample --upscale 1080      # one chapter, to try settings on
 ```
 
 `./ripdvd.py --help` lists the rest (`--title`, `--name`, `--out-dir`, `--quality`,
@@ -83,7 +83,7 @@ themselves.
 sharpening) and stores square pixels at the target size. Be clear about what that
 buys: **it adds no detail**. Your TV or player does nearly the same scaling at playback
 for free. The file just gets bigger. It's worth it mainly when the player's own scaler
-is poor. Try `--sample 60` with and without it and compare on the screen you watch on.
+is poor. Try `--sample` with and without it and compare on the screen you watch on.
 
 Adding detail needs ML upscaling, which is a separate, slow step on the finished
 file:
@@ -98,3 +98,38 @@ file:
 
 The native-resolution MKV is the right master to keep either way. Upscale a copy if
 you decide you like the result.
+
+### Comparing ML upscalers on a Mac
+
+[`upscale_compare.py`](upscale_compare.py) runs short lossless clips through several
+Real-ESRGAN models on each Apple Silicon backend (PyTorch on the GPU, ncnn/Vulkan as
+Upscayl uses, Core ML on the Neural Engine). It builds `upscale-test/results/index.html`,
+which shows two methods as a wipe over synchronized video, with frame stepping, zoom and a
+speed table. Its docstring covers setup. Everything it downloads and writes stays in
+`upscale-test/`, which git ignores.
+
+Results on a fanless M2 MacBook Air (24 GB), with five 5-second clips from *Manufactured
+Landscapes* (720×480 → 1920×1080):
+
+| Model | Backend | Frames/s | 86-min film |
+|---|---|---|---|
+| general x4v3 | Core ML | 3.9 | ~9 h |
+| general x4v3, half denoise | PyTorch | 2.8 | ~13 h |
+| animevideov3 ×2 | ncnn | 2.7 | ~13 h |
+| general x4v3 | PyTorch | 2.5 | ~14 h |
+| x2plus | PyTorch | 0.7 | ~2 days |
+| x4plus | Core ML | 0.5 | ~3 days |
+| x4plus (Upscayl's default) | ncnn | 0.09 | ~16 days |
+
+Numbers moved ±40% between runs as the Air heated up: PyTorch x4v3 ran at 3.6 fps cold
+and 2.5 fps warm. Expect a full film to be at the slow end.
+
+What the stills show:
+
+- **general x4v3** (fast) cleans DVD noise and gives crisp edges, but it smooths skin
+  towards wax and turns hazy areas painterly. The half-denoise blend keeps a little more
+  texture.
+- **animevideov3** is the smoothest: fine for animation, flat on live action.
+- **x4plus** gives the most convincing faces and edges, and it also invents texture.
+  A plain blue object in the e-waste shot comes out speckled.
+- **Lanczos** keeps the grain and invents nothing. It's soft, but nothing in it is false.

@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Upscaler Comparison</title>
+<style>
+  :root {
+    --bg: #111214; --panel: #1b1d21; --line: #2c2f35; --text: #e8e9ec; --muted: #9a9ea8;
+    --accent: #7cc4ff; --accent-ink: #0b2233; --bar: #3a7bb0;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  main { max-width: 1280px; margin: 0 auto; padding: 20px 16px 48px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  h2 { font-size: 15px; margin: 28px 0 10px; }
+  p { margin: 0 0 10px; color: var(--muted); }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 12px 0; }
+  button, select { font: inherit; color: var(--text); background: var(--panel);
+                   border: 1px solid var(--line); border-radius: 6px; padding: 5px 10px; }
+  button:hover, select:hover { border-color: var(--muted); }
+  button[aria-pressed="true"] { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+  label { color: var(--muted); display: flex; gap: 6px; align-items: center; }
+  .spacer { flex: 1; }
+  #stage { position: relative; aspect-ratio: 16 / 9; width: 100%; overflow: hidden;
+           background: #000; border-radius: 8px; cursor: col-resize; user-select: none; }
+  #stage.zoomed { cursor: grab; }
+  #stage.panning { cursor: grabbing; }
+  #layer { position: absolute; inset: 0; transform-origin: 0 0; }
+  #layer video, #layer img { position: absolute; inset: 0; width: 100%; height: 100%;
+                             display: block; image-rendering: auto; }
+  #layer.pixels video, #layer.pixels img { image-rendering: pixelated; }
+  #divider { position: absolute; top: 0; bottom: 0; width: 2px; margin-left: -1px;
+             background: rgba(255,255,255,.85); box-shadow: 0 0 0 1px rgba(0,0,0,.4); pointer-events: none; }
+  .tag { position: absolute; top: 10px; padding: 3px 8px; border-radius: 4px; font-size: 12px;
+         background: rgba(0,0,0,.65); pointer-events: none; max-width: 45%; }
+  #tagA { left: 10px; } #tagB { right: 10px; text-align: right; }
+  .hint { font-size: 12px; color: var(--muted); }
+  kbd { font: 11px ui-monospace, monospace; border: 1px solid var(--line); border-radius: 3px; padding: 0 4px; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+  th { color: var(--muted); font-weight: 500; font-size: 12px; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .bar { height: 8px; background: var(--bar); border-radius: 2px; min-width: 2px; }
+  td.barcell { width: 30%; }
+  ul { color: var(--muted); padding-left: 18px; margin: 0; }
+  li { margin: 4px 0; }
+  @media (max-width: 640px) { td.barcell { display: none; } }
+</style>
+</head>
+<body>
+<main>
+  <h1>Upscaler comparison</h1>
+  <p>Each clip is 5 seconds of the DVD, decoded losslessly at 720×480 and upscaled to 1920×1080.
+     Left of the line is <strong>A</strong> and right is <strong>B</strong>.</p>
+
+  <div class="row" id="clips" role="group" aria-label="Clip"></div>
+
+  <div class="row">
+    <label>A <select id="selA"></select></label>
+    <button id="swap" title="Swap A and B">⇄</button>
+    <label>B <select id="selB"></select></label>
+    <span class="spacer"></span>
+    <span role="group" aria-label="Source" class="row" style="margin:0">
+      <button id="modeVideo" aria-pressed="true">Video</button>
+      <button id="modeStill" aria-pressed="false">Still (frame 60, lossless)</button>
+    </span>
+  </div>
+
+  <div id="stage">
+    <div id="layer"></div>
+    <div id="divider"></div>
+    <div class="tag" id="tagA"></div>
+    <div class="tag" id="tagB"></div>
+  </div>
+
+  <div class="row">
+    <button id="play">Play</button>
+    <button id="back" title="Back one frame">◀ frame</button>
+    <button id="fwd" title="Forward one frame">frame ▶</button>
+    <span class="hint" id="time"></span>
+    <span class="spacer"></span>
+    <span role="group" aria-label="Zoom" class="row" style="margin:0" id="zooms"></span>
+  </div>
+  <p class="hint">Move over the picture to wipe. When zoomed, drag to pan.
+     <kbd>Space</kbd> play · <kbd>←</kbd><kbd>→</kbd> step · <kbd>1</kbd><kbd>2</kbd><kbd>4</kbd> zoom · <kbd>S</kbd> swap</p>
+
+  <h2>What to look for</h2>
+  <ul>
+    <li><strong>faces, elder:</strong> skin turning waxy or plastic, eyes and hair gaining detail that wasn't there.</li>
+    <li><strong>skyline, rubble:</strong> play at 1× and watch for shimmer or crawling texture. These models work one frame at a time.</li>
+    <li><strong>e-waste:</strong> a photograph full of small objects. Watch for shapes the model makes up.</li>
+    <li>Judge at the size you actually watch. 2× and 4× show what changed, not what you'll notice from the couch.</li>
+  </ul>
+
+  <h2>Speed on this Mac</h2>
+  <p>Model time per frame on the five clips, including GPU transfers. The film is 124,300 frames.
+     These runs are short, and a fanless MacBook Air slows down over hours of sustained load, so expect longer than this for a whole film.</p>
+  <table>
+    <thead><tr><th>Method</th><th>Runs on</th><th class="num">Frames/s</th><th class="num">Whole film</th><th class="barcell"></th></tr></thead>
+    <tbody id="speeds"></tbody>
+  </table>
+</main>
+
+<script>
+const DATA = /*DATA*/null;
+const $ = (id) => document.getElementById(id);
+const FPS = 24000 / 1001;
+const methodByKey = Object.fromEntries(DATA.methods.map((m) => [m.key, m]));
+const state = {
+  clip: DATA.clips[0],
+  a: methodByKey.lanczos ? "lanczos" : DATA.methods[0].key,
+  b: (DATA.methods.find((m) => m.key !== "lanczos") || DATA.methods[0]).key,
+  mode: "video", split: 0.5, zoom: 1, tx: 0, ty: 0, playing: false,
+};
+try { Object.assign(state, JSON.parse(localStorage.getItem("upscale-compare") || "{}"), { playing: false }); } catch {}
+const save = () => { try { localStorage.setItem("upscale-compare", JSON.stringify(state)); } catch {} };
+
+const label = (m) => `${m.label} · ${m.engine}`;
+let mediaA, mediaB;
+
+function buildControls() {
+  $("clips").innerHTML = "";
+  for (const c of DATA.clips) {
+    const b = document.createElement("button");
+    b.textContent = c;
+    b.setAttribute("aria-pressed", c === state.clip);
+    b.onclick = () => { state.clip = c; buildControls(); load(); };
+    $("clips").append(b);
+  }
+  for (const [sel, side] of [[$("selA"), "a"], [$("selB"), "b"]]) {
+    sel.innerHTML = DATA.methods.map((m) =>
+      `<option value="${m.key}" ${m.key === state[side] ? "selected" : ""}>${label(m)}</option>`).join("");
+    sel.onchange = () => { state[side] = sel.value; load(); };
+  }
+  $("zooms").innerHTML = "";
+  for (const z of [1, 2, 4]) {
+    const b = document.createElement("button");
+    b.textContent = `${z}×`;
+    b.setAttribute("aria-pressed", z === state.zoom);
+    b.onclick = () => setZoom(z);
+    $("zooms").append(b);
+  }
+  $("modeVideo").setAttribute("aria-pressed", state.mode === "video");
+  $("modeStill").setAttribute("aria-pressed", state.mode === "still");
+  for (const id of ["play", "back", "fwd"]) $(id).disabled = state.mode !== "video";
+}
+
+function makeMedia(key) {
+  const src = `${state.clip}/${key}.${state.mode === "video" ? "mp4" : "png"}`;
+  if (state.mode === "still") {
+    const img = new Image(); img.src = src; img.alt = methodByKey[key].label; return img;
+  }
+  const v = document.createElement("video");
+  Object.assign(v, { src, muted: true, loop: true, playsInline: true, preload: "auto" });
+  return v;
+}
+
+function load() {
+  const t = mediaA && mediaA.currentTime || 0;
+  const layer = $("layer");
+  layer.innerHTML = "";
+  mediaA = makeMedia(state.a); mediaB = makeMedia(state.b);
+  layer.append(mediaA, mediaB);
+  $("tagA").textContent = "A · " + label(methodByKey[state.a]);
+  $("tagB").textContent = "B · " + label(methodByKey[state.b]);
+  if (state.mode === "video") {
+    mediaA.addEventListener("loadedmetadata", () => { mediaA.currentTime = t; mediaB.currentTime = t; });
+    if (state.playing) Promise.all([mediaA.play(), mediaB.play()]).catch(() => {});
+    syncLoop();
+  }
+  applyView(); save();
+}
+
+function syncLoop() {
+  const a = mediaA, b = mediaB;
+  if (!a.requestVideoFrameCallback) return;
+  const tick = (_, meta) => {
+    if (a !== mediaA) return;
+    if (Math.abs(b.currentTime - meta.mediaTime) > 0.5 / FPS) b.currentTime = meta.mediaTime;
+    $("time").textContent = `frame ${Math.round(meta.mediaTime * FPS)}`;
+    a.requestVideoFrameCallback(tick);
+  };
+  a.requestVideoFrameCallback(tick);
+}
+
+function applyView() {
+  const stage = $("stage"), w = stage.clientWidth, h = stage.clientHeight, z = state.zoom;
+  state.tx = Math.min(0, Math.max(w - w * z, state.tx));
+  state.ty = Math.min(0, Math.max(h - h * z, state.ty));
+  $("layer").style.transform = `translate(${state.tx}px, ${state.ty}px) scale(${z})`;
+  $("layer").classList.toggle("pixels", z >= 4);
+  stage.classList.toggle("zoomed", z > 1);
+  const xScreen = state.split * w;
+  const xLayer = (xScreen - state.tx) / z;
+  if (mediaB) mediaB.style.clipPath = `inset(0 0 0 ${(xLayer / w) * 100}%)`;
+  $("divider").style.left = `${xScreen}px`;
+}
+
+function setZoom(z) {
+  const stage = $("stage"), w = stage.clientWidth, h = stage.clientHeight;
+  // Keep the point under the divider (vertically centred) fixed while zooming
+  const cx = state.split * w, cy = h / 2;
+  const lx = (cx - state.tx) / state.zoom, ly = (cy - state.ty) / state.zoom;
+  state.zoom = z; state.tx = cx - lx * z; state.ty = cy - ly * z;
+  buildControls(); applyView(); save();
+}
+
+function step(frames) {
+  if (state.mode !== "video") return;
+  pause();
+  const t = Math.max(0, Math.min(mediaA.duration - 1 / FPS, mediaA.currentTime + frames / FPS));
+  mediaA.currentTime = t; mediaB.currentTime = t;
+  $("time").textContent = `frame ${Math.round(t * FPS)}`;
+}
+function pause() { state.playing = false; mediaA.pause?.(); mediaB.pause?.(); $("play").textContent = "Play"; }
+function togglePlay() {
+  if (state.mode !== "video") return;
+  if (state.playing) return pause();
+  state.playing = true; $("play").textContent = "Pause";
+  mediaB.currentTime = mediaA.currentTime;
+  Promise.all([mediaA.play(), mediaB.play()]).catch(() => {});
+}
+
+const stage = $("stage");
+let drag = null;
+stage.addEventListener("pointerdown", (e) => {
+  if (state.zoom === 1) return;
+  drag = { x: e.clientX, y: e.clientY, tx: state.tx, ty: state.ty };
+  stage.setPointerCapture(e.pointerId); stage.classList.add("panning");
+});
+stage.addEventListener("pointermove", (e) => {
+  const r = stage.getBoundingClientRect();
+  if (drag) {
+    state.tx = drag.tx + e.clientX - drag.x; state.ty = drag.ty + e.clientY - drag.y;
+  } else {
+    state.split = Math.min(1, Math.max(0, (e.clientX - r.left) / r.width));
+  }
+  applyView();
+});
+const endDrag = () => { drag = null; stage.classList.remove("panning"); save(); };
+stage.addEventListener("pointerup", endDrag);
+stage.addEventListener("pointercancel", endDrag);
+window.addEventListener("resize", applyView);
+
+$("swap").onclick = () => { [state.a, state.b] = [state.b, state.a]; buildControls(); load(); };
+$("modeVideo").onclick = () => { state.mode = "video"; buildControls(); load(); };
+$("modeStill").onclick = () => { state.mode = "still"; state.playing = false; buildControls(); load(); };
+$("play").onclick = togglePlay;
+$("back").onclick = () => step(-1);
+$("fwd").onclick = () => step(1);
+document.addEventListener("keydown", (e) => {
+  if (e.target.tagName === "SELECT") return;
+  if (e.key === " ") { e.preventDefault(); togglePlay(); }
+  else if (e.key === "ArrowLeft") step(-1);
+  else if (e.key === "ArrowRight") step(1);
+  else if (["1", "2", "4"].includes(e.key)) setZoom(Number(e.key));
+  else if (e.key.toLowerCase() === "s") $("swap").click();
+});
+
+function buildSpeeds() {
+  const rows = DATA.methods.filter((m) => m.fps);
+  const max = Math.max(...rows.map((m) => m.film_hours));
+  const fmt = (h) => h < 1 ? `${Math.round(h * 60)} min` : `${h.toFixed(1)} h`;
+  $("speeds").innerHTML = rows.sort((a, b) => a.film_hours - b.film_hours).map((m) => `
+    <tr><td>${m.label}</td><td>${m.engine}</td><td class="num">${m.fps.toFixed(2)}</td>
+    <td class="num">${fmt(m.film_hours)}</td>
+    <td class="barcell"><div class="bar" style="width:${(m.film_hours / max) * 100}%"></div></td></tr>`).join("");
+}
+
+if (!DATA.clips.includes(state.clip)) state.clip = DATA.clips[0];
+for (const s of ["a", "b"]) if (!methodByKey[state[s]]) state[s] = DATA.methods[0].key;
+buildControls(); load(); buildSpeeds();
+</script>
+</body>
+</html>
