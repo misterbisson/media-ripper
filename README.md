@@ -16,10 +16,16 @@ leaves out.
 ## Setup (macOS)
 
 ```
-brew install handbrake libdvdcss
+brew install handbrake libdvdcss ffmpeg mkvtoolnix
 ```
 
-Python 3.10+ standard library only. Nothing to install.
+`ripdvd.py` needs only Python 3.10+'s standard library. The optional ML upscaler,
+`upscale.py`, needs PyTorch and coremltools (see *ML upscaling* below).
+
+DVD drives are region-locked. A drive set to region 1 won't read a region 2 disc, and
+nothing in software gets around it. `ripdvd.py` says so when that's the problem. Use
+a second drive set to the other region, or change this one's in macOS's DVD Player.
+Drives allow 5 changes, and the last one sticks.
 
 ## Use
 
@@ -86,18 +92,57 @@ for free. The file just gets bigger. It's worth it mainly when the player's own 
 is poor. Try `--sample` with and without it and compare on the screen you watch on.
 
 Adding detail needs ML upscaling, which is a separate, slow step on the finished
-file:
+rip. The native-resolution MKV is the right master to keep either way.
 
-- **Upscayl** is built for still images (Real-ESRGAN models). For video you'd split
-  into frames, upscale each and reassemble. That works, but it's slow, and the
-  general-purpose models tend to flicker and paint over film grain.
-- **Real-ESRGAN / video2x** are the same models scripted for video. Free, but mostly
-  aimed at Linux/Windows GPUs, and best on animation.
-- **Topaz Video AI** (paid) is the usual answer for live action on a Mac: video models
-  that look across frames, so less flicker, with dedicated DVD/deinterlace models.
+### ML upscaling: `upscale.py`
 
-The native-resolution MKV is the right master to keep either way. Upscale a copy if
-you decide you like the result.
+```
+python3.12 -m venv .venv && .venv/bin/pip install torch coremltools numpy
+.venv/bin/python upscale.py "~/Movies/Film (2006)/Film (2006).mkv" --sample   # ~30 s first
+.venv/bin/python upscale.py "~/Movies/Film (2006)/Film (2006).mkv"            # overnight
+```
+
+This writes `Film (2006) - 1080p.mkv` beside the rip. Jellyfin and Plex show it as a
+second version of the same film. The pipeline:
+
+1. ffmpeg decodes the rip.
+2. Real-ESRGAN general-x4v3 upscales 4× on the Neural Engine. On first use it downloads
+   the 4 MB weights and converts them to Core ML for the rip's frame size, in `models/`.
+3. The GPU resizes to 1080p at the film's real aspect ratio, with square pixels, and adds
+   luma grain.
+4. x265 encodes 10-bit HEVC.
+5. mkvmerge puts it together with the rip's audio, subtitles, chapters and track flags,
+   unchanged. It also restores each frame's original timestamp. Rips are often
+   variable frame rate: HandBrake returns film to 23.976 fps but leaves video-shot
+   stretches at 29.97. Forcing one rate would drop or repeat frames there.
+
+Options:
+
+- `--grain 3`: grain strength. Use 0 for none.
+- `--denoise 1`: Real-ESRGAN's denoise strength.
+- `--crf 21` and `--preset medium`: x265 quality and speed.
+- `--height`: output height, 1080 by default.
+
+The Mac stays awake while it runs, and progress shows frames per second and time left.
+
+A warm M2 MacBook Air manages about 4 frames a second, so 9 to 10 hours for a
+90-minute film. The finished-run summary shows where each frame's time went. On the
+Air, the Neural Engine, GPU and x265 all share one fanless power budget, so a Mac with
+a fan should do better. The settings come from the comparison below.
+
+For the cleanest input, rip with `./ripdvd.py -q 0`. That's lossless x264, so the
+upscaler never sees x264's own compression. It's about 6 GB per film.
+
+Other options, for reference:
+
+- **Upscayl** is built for still images (Real-ESRGAN models). Its default model
+  (x4plus) invents texture and takes days per film on a Mac.
+- **Real-ESRGAN / video2x** script the same models for video, mostly for Linux/Windows
+  GPUs.
+- **Topaz Video AI** (paid) uses video models that look across frames, so less
+  flicker, with dedicated DVD/deinterlace models.
+- **SeedVR2 and FlashVSR** are diffusion models with the most convincing detail. They
+  need an NVIDIA GPU, or days per film.
 
 ### Comparing ML upscalers on a Mac
 
