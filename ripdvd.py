@@ -108,6 +108,15 @@ def scan(disc):
     marker = "JSON Title Set:"
     idx = proc.stdout.find(marker)
     if idx < 0:
+        if not Path(disc).exists():
+            sys.exit("The disc went away during the scan: the drive was unplugged, lost "
+                     "power or ejected it. A bus-powered USB drive can drop out on a hub "
+                     "or a long cable; plug it straight into the Mac.")
+        try:
+            (Path(disc) / "VIDEO_TS" / "VIDEO_TS.IFO").read_bytes()
+        except OSError as e:
+            sys.exit(f"The drive can't read this disc ({e.strerror}). Clean it and try "
+                     "again, or try another drive.")
         drive = re.search(r"drive region\(s\) (\d)", proc.stderr)
         regions = disc_regions(disc)
         if drive and regions and int(drive[1]) not in regions:
