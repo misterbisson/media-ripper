@@ -11,22 +11,24 @@ and mkvmerge puts the new video together with the rip's audio, subtitles, chapte
 and frame timing, all untouched. A warm M2 MacBook Air manages about 4 frames a
 second, so 9 to 10 hours for a 90-minute film. The Mac is kept awake meanwhile.
 
-Setup (Apple Silicon, once):
-    brew install ffmpeg mkvtoolnix
-    python3.12 -m venv .venv && .venv/bin/pip install torch coremltools numpy
-
-The model weights (4 MB each) download from Real-ESRGAN's GitHub releases on first
-use. They're converted to Core ML once per frame size, in models/.
+Needs `brew install ffmpeg mkvtoolnix python@3.12`. On first use it offers to put
+PyTorch and coremltools (about 800 MB) in .venv/ beside it, and from then on runs
+itself with that. The model weights (4 MB each) download from Real-ESRGAN's GitHub
+releases, and are converted to Core ML once per frame size, in models/.
 
 Usage:
-    .venv/bin/python upscale.py "~/Movies/Film (2006)/Film (2006).mkv"
-    .venv/bin/python upscale.py film.mkv --sample     # 20-30 s from the middle
-    .venv/bin/python upscale.py film.mkv --grain 0 --denoise 0.5
+    ./upscale.py "~/Movies/Film (2006)/Film (2006).mkv"
+    ./upscale.py film.mkv --sample     # 20-30 s from the middle
+    ./upscale.py film.mkv --grain 0 --denoise 0.5
+    ./upscale.py --enqueue film.mkv    # upscale in the background, one at a time
+    ./upscale.py --status              # what's queued, running and failed
 """
 
 import argparse
+import fcntl
 import hashlib
 import json
+import logging
 import multiprocessing
 import os
 import queue
@@ -35,13 +37,61 @@ import subprocess
 import sys
 import time
 import urllib.request
+import warnings
+from datetime import datetime
 from fractions import Fraction
 from multiprocessing import shared_memory
 from pathlib import Path
 
-import numpy as np
+HERE = Path(__file__).resolve().parent
+VENV = HERE / ".venv"
+# The versions this was tested with. coremltools trails PyTorch, so newer ones
+# may not convert the model.
+PACKAGES = ["torch==2.14.1", "coremltools==9.0", "numpy==2.5.4"]
+PYTHONS = ["python3.12", "python3.13", "python3.11"]
 
-MODELS = Path(__file__).resolve().parent / "models"
+
+def setup(yes=False):
+    """Create .venv with PyTorch and coremltools, after asking."""
+    ready = VENV / "media-ripper-ready"
+    if ready.exists():
+        return
+    python = next(filter(None, map(shutil.which, PYTHONS)), None)
+    if not python:
+        sys.exit("ML upscaling needs Python 3.11 to 3.13: brew install python@3.12")
+    if not yes:
+        if not sys.stdin.isatty():
+            sys.exit(f"ML upscaling isn't set up yet: run {HERE / 'upscale.py'} --setup")
+        try:
+            reply = input(f"ML upscaling needs PyTorch and coremltools (about 800 MB) in "
+                          f"{VENV}. Install them now? [Y/n] ")
+        except EOFError:
+            reply = "n"
+        if reply.strip().lower() not in ("", "y", "yes"):
+            sys.exit("Not installed.")
+    print(f"Installing {', '.join(PACKAGES)} …", flush=True)
+    shutil.rmtree(VENV, ignore_errors=True)
+    subprocess.run([python, "-m", "venv", str(VENV)], check=True)
+    subprocess.run([str(VENV / "bin" / "pip"), "install", "-q", "--disable-pip-version-check",
+                    *PACKAGES], check=True)
+    ready.touch()
+
+
+# Run as a script with any python3, this sets up .venv if need be and re-runs
+# itself there, before importing anything that only the venv has.
+if __name__ == "__main__" and Path(sys.prefix).resolve() != VENV:
+    setup(yes="--yes" in sys.argv or "-y" in sys.argv)
+    venv_python = str(VENV / "bin" / "python")
+    os.execv(venv_python, [venv_python, str(HERE / "upscale.py"), *sys.argv[1:]])
+
+import numpy as np  # noqa: E402
+
+# Quiet in the log: coremltools warns on every import that it hasn't been tested
+# with this PyTorch, and PyTorch that the tracing used for conversion is deprecated
+logging.getLogger("coremltools").setLevel(logging.ERROR)
+warnings.filterwarnings("ignore", category=FutureWarning, module="torch")
+
+MODELS = HERE / "models"
 RELEASES = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/"
 WEIGHTS = {
     "realesr-general-x4v3.pth":
@@ -254,6 +304,7 @@ def upscale(src, dst, args):
 
     spent = {"grain": 0.0, "encode": 0.0}
     t0 = last = time.monotonic()
+    tty = sys.stdout.isatty()
     done = 0
     try:
         while True:
@@ -276,11 +327,13 @@ def upscale(src, dst, args):
             spent["encode"] += time.monotonic() - t2
             done += 1
             now = time.monotonic()
-            if now - last >= 5:
+            # A line that updates in place on a terminal; one a minute in a log
+            if now - last >= (5 if tty else 60):
                 fps = done / (now - t0)
                 eta = max(total - done, 0) / fps if fps else 0
-                print(f"\r  {done}/{total} frames, {fps:.2f} fps, "
-                      f"{eta / 3600:.0f}h{eta % 3600 / 60:02.0f}m left ", end="", flush=True)
+                line = (f"  {done}/{total} frames, {fps:.2f} fps, "
+                        f"{eta / 3600:.0f}h{eta % 3600 / 60:02.0f}m left ")
+                print("\r" + line if tty else line, end="" if tty else "\n", flush=True)
                 last = now
     finally:
         del slots
@@ -293,7 +346,7 @@ def upscale(src, dst, args):
 
     # The new video with the rip's timestamps, plus everything but video from the
     # rip: audio, subtitles, chapters, title, and track names and flags as they were
-    title = f"Real-ESRGAN {out_h}p" + (f" + grain {args.grain}" if args.grain else "")
+    title = f"Real-ESRGAN {args.height}p" + (f" + grain {args.grain:g}" if args.grain else "")
     mkvmerge("-o", part, "--timestamps", f"0:{times}", "--track-name", f"0:{title}",
              "--default-track-flag", "0:yes", video, "--no-video", src)
     part.rename(dst)
@@ -343,9 +396,111 @@ def infer_worker(decode_cmd, package, w, h, shm_name, free, ready):
         shm.close()
 
 
+# ---------------------------------------------------------------- the queue
+
+# One JSON file per job, oldest first. A worker runs them one at a time, since two
+# upscales would only share the Neural Engine and GPU. It holds a lock while it
+# works, so whoever adds a job can start a worker without checking for one.
+STATE = Path.home() / "Library" / "Application Support" / "media-ripper"
+QUEUE, FAILED, LOCK = STATE / "queue", STATE / "failed", STATE / "worker.lock"
+LOG = Path.home() / "Library" / "Logs" / "media-ripper" / "upscale.log"
+
+
+def pending():
+    return sorted(QUEUE.glob("*.json"))
+
+
+def enqueue(src, options):
+    QUEUE.mkdir(parents=True, exist_ok=True)
+    if any(json.loads(p.read_text())["input"] == str(src) for p in pending()):
+        print(f"Already queued: {src}")
+    else:
+        job = {"input": str(src), "options": options, "queued": datetime.now().isoformat()}
+        (QUEUE / f"{time.time_ns()}.json").write_text(json.dumps(job))
+        print(f"Queued for upscaling: {src.name}")
+    LOG.parent.mkdir(parents=True, exist_ok=True)
+    with open(LOG, "a") as log:
+        subprocess.Popen([sys.executable, str(HERE / "upscale.py"), "--worker"],
+                         stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                         start_new_session=True)
+    print(f"Progress: ./upscale.py --status, or the log at {LOG}")
+
+
+def worker_running():
+    STATE.mkdir(parents=True, exist_ok=True)
+    with open(LOCK, "a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return False
+        except BlockingIOError:
+            return True
+
+
+def run_queue():
+    # Below rips and everything else, which get the CPU first
+    os.nice(10)
+    STATE.mkdir(parents=True, exist_ok=True)
+    while True:
+        with open(LOCK, "a") as lock:
+            # Retry briefly: --status takes the lock for a moment to test it
+            for _ in range(10):
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    time.sleep(0.2)
+            else:
+                return  # another worker has it, and will get to our job
+            while jobs := pending():
+                run_job(jobs[0])
+        # A job added while this one was letting go of the lock
+        if not pending():
+            return
+
+
+def run_job(path):
+    job = json.loads(path.read_text())
+    stamp = lambda: datetime.now().strftime("%Y-%m-%d %H:%M")
+    print(f"\n{stamp()}  Upscaling {job['input']}", flush=True)
+    status = subprocess.run([sys.executable, str(HERE / "upscale.py"),
+                             job["input"], *job["options"]]).returncode
+    if status == 0:
+        path.unlink()
+    else:
+        FAILED.mkdir(parents=True, exist_ok=True)
+        path.rename(FAILED / path.name)
+        print(f"{stamp()}  Failed (exit {status}); kept in {FAILED}", flush=True)
+
+
+def show_status():
+    jobs, failed = pending(), sorted(FAILED.glob("*.json"))
+    running = worker_running()
+    name = lambda p: Path(json.loads(p.read_text())["input"]).name
+    for i, job in enumerate(jobs):
+        print(f"{'running' if i == 0 and running else 'queued ':7}  {name(job)}")
+    if jobs and running and LOG.exists():
+        current = LOG.read_text().rpartition("  Upscaling ")[2]
+        lines = [l for l in current.splitlines() if " fps, " in l]
+        print(f"         {lines[-1].strip() if lines else 'starting'}")
+    if jobs and not running:
+        print("No worker is running. Start one with ./upscale.py --worker")
+    for job in failed:
+        print(f"failed   {name(job)}  (to retry, move it from {FAILED} to {QUEUE})")
+    if not jobs and not failed:
+        print("Nothing queued.")
+    print(f"Log: {LOG}")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("input", type=Path, help="an MKV from ripdvd.py")
+    ap.add_argument("input", type=Path, nargs="?", help="an MKV from ripdvd.py")
+    ap.add_argument("--enqueue", action="store_true",
+                    help="add the input to the background queue instead of upscaling now")
+    ap.add_argument("--status", action="store_true", help="show the queue and exit")
+    ap.add_argument("--worker", action="store_true",
+                    help="run the queue in this terminal (one starts by itself on --enqueue)")
+    ap.add_argument("--setup", action="store_true", help="install PyTorch and coremltools, then exit")
+    ap.add_argument("-y", "--yes", action="store_true", help="install them without asking")
     ap.add_argument("-o", "--output", type=Path,
                     help='output file (default: "<input> - 1080p.mkv" beside it)')
     ap.add_argument("--height", type=int, default=1080, help="output height (default: 1080)")
@@ -359,12 +514,27 @@ def main():
                     help=f"only {SAMPLE_SECS} s from the middle, to check settings")
     args = ap.parse_args()
 
+    if args.setup:
+        print("ML upscaling is set up.")  # setup() ran before the venv took over
+        return
+    if args.status:
+        return show_status()
+    if args.worker:
+        return run_queue()
+    if not args.input:
+        ap.error("give an MKV to upscale")
     src = args.input.expanduser().resolve()
     if not src.exists():
         sys.exit(f"{src}: not found")
     for tool, package in (("ffmpeg", "ffmpeg"), ("mkvmerge", "mkvtoolnix")):
         if not shutil.which(tool):
             sys.exit(f"{tool} not found: brew install {package}")
+    if args.enqueue:
+        options = ["--height", str(args.height), "--grain", str(args.grain),
+                   "--denoise", str(args.denoise), "--crf", str(args.crf), "--preset", args.preset]
+        options += ["--sample"] if args.sample else []
+        options += ["-o", str(args.output.expanduser().resolve())] if args.output else []
+        return enqueue(src, options)
     suffix = f" - {args.height}p" + (" sample" if args.sample else "")
     dst = args.output or src.with_name(src.stem + suffix + ".mkv")
     # Keep the Mac awake (but let the display sleep) until this process exits

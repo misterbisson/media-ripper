@@ -8,13 +8,15 @@
 - Keeps every audio track in the original language and English (incl. commentary),
   passed through untouched (AC3/DTS), with chapters
 - Keeps English subtitles as soft (selectable, not burned-in) VOBSUB tracks
-- Optionally upscales to 720p/1080p (plain Lanczos scaling, no AI)
+- With --upscale, queues each rip for upscale.py (Real-ESRGAN to 1080p), which
+  works through the queue in the background, so the next disc can go in
 
 Usage:
     ./ripdvd.py                 # rip whatever disc is inserted
     ./ripdvd.py --list          # show titles/tracks and exit
     ./ripdvd.py --loop --eject  # rip, eject, wait for the next disc, repeat
-    ./ripdvd.py --sample --upscale 1080   # one chapter, to compare settings
+    ./ripdvd.py --loop --upscale            # ...and upscale each one overnight
+    ./ripdvd.py --sample --upscale          # one chapter, to check settings
 """
 
 import argparse
@@ -31,6 +33,7 @@ from pathlib import Path
 import metadata
 
 HANDBRAKE = shutil.which("HandBrakeCLI") or "HandBrakeCLI"
+UPSCALE = Path(__file__).resolve().parent / "upscale.py"
 PRESET_NAME = "ripdvd"
 SMALL_WORDS = {"a", "an", "and", "as", "at", "but", "by", "for", "in", "nor",
                "of", "on", "or", "the", "to", "vs", "with"}
@@ -202,11 +205,8 @@ def select_subtitles(title, langs):
 # ---------------------------------------------------------------- encoding
 
 def build_preset(title, args):
-    """Start from HandBrake's 'H.264 MKV' preset and adjust it.
-
-    Upscaling can only be enabled via a preset (there's no CLI flag), so we
-    generate one rather than splitting settings between flags and presets.
-    """
+    """Start from HandBrake's 'H.264 MKV' preset and adjust it, which keeps every
+    picture setting in one place rather than split between flags and a preset."""
     pal = title["Geometry"]["Height"] > 480
     base = "H.264 MKV 576p25" if pal else "H.264 MKV 480p30"
     with tempfile.TemporaryDirectory() as tmp:
@@ -229,25 +229,12 @@ def build_preset(title, args):
         "PictureCombDetectPreset": "default",
         "PictureDeinterlaceFilter": "decomb",
         "PictureDeinterlacePreset": "default",
-    })
-    if args.upscale:
-        height = int(args.upscale)
-        p.update({
-            "PictureAllowUpscaling": True,
-            "PictureUseMaximumSize": True,
-            "PictureWidth": height * 16 // 9,
-            "PictureHeight": height,
-            # Square pixels at the target size instead of anamorphic DVD pixels
-            "PicturePAR": "off",
-            "VideoScaler": "zscale",
-            "PictureSharpenFilter": "lapsharp",
-            "PictureSharpenPreset": "light",
-            "PictureSharpenTune": "film",
-        })
-    else:
         # Keep the DVD's native resolution and anamorphic aspect
-        p.update({"PictureWidth": 720, "PictureHeight": 576 if pal else 480,
-                  "PictureUseMaximumSize": True, "PicturePAR": "auto"})
+        "PictureWidth": 720,
+        "PictureHeight": 576 if pal else 480,
+        "PictureUseMaximumSize": True,
+        "PicturePAR": "auto",
+    })
     return doc
 
 
@@ -312,7 +299,7 @@ def output_path(name, args):
     """Movies go in their own folder, Kodi/Jellyfin/Plex style; samples don't."""
     stem = safe_filename(name)
     if args.sample:
-        folder, stem = args.out_dir, f"{stem} [sample {args.upscale or 'native'}]"
+        folder, stem = args.out_dir, f"{stem} [sample]"
     else:
         folder = args.out_dir / stem
     path = folder / f"{stem}.mkv"
@@ -380,10 +367,18 @@ def rip_one(disc, args):
     interactive = not args.yes and sys.stdin.isatty()
     name = args.name or name_from_label(disc.name)
     if interactive:
-        reply = input(f"Title [{title['Index']}]: ").strip()
-        if reply:
-            title = pick_title(data, int(reply))
-        name = input(f"Name [{name}]: ").strip() or name
+        titles = {t["Index"] for t in data["TitleList"]}
+        while True:
+            reply = input(f"Title [{title['Index']}]: ").strip()
+            if reply.lower() in ("", "y", "yes"):
+                break
+            if reply.isdigit() and int(reply) in titles:
+                title = pick_title(data, int(reply))
+                break
+            print(f"Enter a title number from the list, or press Return for {title['Index']}.")
+        reply = input(f"Name [{name}]: ").strip()
+        if reply.lower() not in ("", "y", "yes"):
+            name = reply
 
     film = None
     if not args.no_metadata and not args.sample:
@@ -399,6 +394,10 @@ def rip_one(disc, args):
     ok = encode(disc, title, out, args)
     if ok and film:
         write_metadata(film, out)
+    if ok and args.upscale:
+        # A sample rip is one chapter; upscale ~30 s of it to check the look
+        subprocess.run([sys.executable, str(UPSCALE), "--enqueue", str(out),
+                        *(["--sample"] if args.sample else [])])
     return ok
 
 
@@ -414,8 +413,9 @@ def main():
     ap.add_argument("--audio-langs", default="eng",
                     help="audio languages to keep besides the original (default: eng)")
     ap.add_argument("--sub-langs", default="eng", help="subtitle languages (default: eng)")
-    ap.add_argument("--upscale", choices=["720", "1080"],
-                    help="scale up to 720p/1080p (default: keep DVD resolution)")
+    ap.add_argument("--upscale", action="store_true",
+                    help="also make a 1080p version with upscale.py, in the background "
+                         "(the first time, offers to install what it needs)")
     ap.add_argument("--encoder", default="x264", choices=["x264", "x265", "x265_10bit"],
                     help="video encoder (default: x264)")
     ap.add_argument("-q", "--quality", type=float, default=19,
@@ -429,6 +429,8 @@ def main():
                     help="after each disc, wait for the next one (implies --yes)")
     ap.add_argument("-v", "--verbose", action="store_true", help="print the HandBrake command")
     args = ap.parse_args()
+    # Keep our lines in order with HandBrake's and upscale.py's when piped to a log
+    sys.stdout.reconfigure(line_buffering=True)
     args.audio_langs = args.audio_langs.split(",")
     args.sub_langs = args.sub_langs.split(",")
     args.out_dir = args.out_dir.expanduser()
@@ -437,6 +439,14 @@ def main():
 
     if not shutil.which(HANDBRAKE):
         sys.exit("HandBrakeCLI not found: brew install handbrake")
+    if args.upscale and not args.list:
+        # Before ripping, so any question about installing comes now, not hours later
+        for tool, package in (("ffmpeg", "ffmpeg"), ("mkvmerge", "mkvtoolnix")):
+            if not shutil.which(tool):
+                sys.exit(f"{tool} not found: brew install {package}")
+        setup = [sys.executable, str(UPSCALE), "--setup", *(["--yes"] if args.yes else [])]
+        if subprocess.run(setup).returncode:
+            sys.exit(1)
 
     if args.loop:
         while True:

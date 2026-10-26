@@ -16,11 +16,12 @@ leaves out.
 ## Setup (macOS)
 
 ```
-brew install handbrake libdvdcss ffmpeg mkvtoolnix
+brew install handbrake libdvdcss ffmpeg mkvtoolnix python@3.12
 ```
 
-`ripdvd.py` needs only Python 3.10+'s standard library. The optional ML upscaler,
-`upscale.py`, needs PyTorch and coremltools (see *ML upscaling* below).
+`ripdvd.py` needs only Python 3.10+'s standard library. The ML upscaler also needs
+PyTorch and coremltools. The first time you use `--upscale`, it offers to install them
+into `.venv/` (about 800 MB, a couple of minutes).
 
 DVD drives are region-locked. A drive set to region 1 won't read a region 2 disc, and
 nothing in software gets around it. `ripdvd.py` says so when that's the problem. Use
@@ -34,11 +35,13 @@ Drives allow 5 changes, and the last one sticks.
 ./ripdvd.py --list           # show the disc's titles and tracks, then stop
 ./ripdvd.py -y --eject       # no questions; eject when done
 ./ripdvd.py --loop           # rip, eject, wait for the next disc, repeat
-./ripdvd.py --sample --upscale 1080      # one chapter, to try settings on
+./ripdvd.py --upscale        # rip, then make a 1080p version in the background
+./ripdvd.py --loop --upscale # feed it discs all evening; the upscales run overnight
+./upscale.py --status        # what's upscaling, what's waiting, what failed
 ```
 
 `./ripdvd.py --help` lists the rest (`--title`, `--name`, `--out-dir`, `--quality`,
-`--encoder`, `--audio-langs`, `--sub-langs`, `--no-metadata`).
+`--encoder`, `--audio-langs`, `--sub-langs`, `--no-metadata`, `--sample`).
 
 ## What it picks
 
@@ -85,29 +88,38 @@ themselves.
 
 ## Upscaling
 
-`--upscale 720|1080` scales with a good conventional filter (zscale/Lanczos plus light
-sharpening) and stores square pixels at the target size. Be clear about what that
-buys: **it adds no detail**. Your TV or player does nearly the same scaling at playback
-for free. The file just gets bigger. It's worth it mainly when the player's own scaler
-is poor. Try `--sample` with and without it and compare on the screen you watch on.
+Plain scaling (Lanczos and the like) adds no detail: your TV or player does the same
+at playback, for free. So `ripdvd.py` always keeps the DVD's native resolution, and
+the native MKV is the master to keep. Adding detail takes an ML upscaler, which is
+slow.
 
-Adding detail needs ML upscaling, which is a separate, slow step on the finished
-rip. The native-resolution MKV is the right master to keep either way.
-
-### ML upscaling: `upscale.py`
+`--upscale` hands each finished rip to `upscale.py` and goes on to the next disc. A
+background worker upscales queued films one at a time, at low priority so rips
+come first. It writes `Film (2006) - 1080p.mkv` beside the rip, and Jellyfin and Plex
+show that as a second version of the same film. Check the look first on one chapter:
+`./ripdvd.py --sample --upscale` upscales about 30 seconds of it.
 
 ```
-python3.12 -m venv .venv && .venv/bin/pip install torch coremltools numpy
-.venv/bin/python upscale.py "~/Movies/Film (2006)/Film (2006).mkv" --sample   # ~30 s first
-.venv/bin/python upscale.py "~/Movies/Film (2006)/Film (2006).mkv"            # overnight
+./upscale.py --status                  # running, queued and failed, with progress
+./upscale.py film.mkv                  # upscale a rip now, in this terminal
+./upscale.py film.mkv --sample         # ~30 s from the middle
+./upscale.py --enqueue film.mkv        # add a rip to the background queue
 ```
 
-This writes `Film (2006) - 1080p.mkv` beside the rip. Jellyfin and Plex show it as a
-second version of the same film. The pipeline:
+The queue lives in `~/Library/Application Support/media-ripper/`, and the log is
+`~/Library/Logs/media-ripper/upscale.log`. If the Mac restarts mid-film, that film
+stays queued: the next `--enqueue` starts a worker again, or run
+`./upscale.py --worker` to start one yourself. It begins that film from the start.
+
+### How `upscale.py` works
+
+The pipeline:
 
 1. ffmpeg decodes the rip.
 2. Real-ESRGAN general-x4v3 upscales 4× on the Neural Engine. On first use it downloads
-   the 4 MB weights and converts them to Core ML for the rip's frame size, in `models/`.
+   the 4 MB weights. It converts them to Core ML for each new frame size, which varies
+   with how HandBrake cropped the letterbox bars. That takes a minute or two once per
+   size, and the result is kept in `models/`.
 3. The GPU resizes to 1080p at the film's real aspect ratio, with square pixels, and adds
    luma grain.
 4. x265 encodes 10-bit HEVC.
@@ -116,7 +128,7 @@ second version of the same film. The pipeline:
    variable frame rate: HandBrake returns film to 23.976 fps but leaves video-shot
    stretches at 29.97. Forcing one rate would drop or repeat frames there.
 
-Options:
+Options for `./upscale.py` (`ripdvd.py --upscale` uses the defaults):
 
 - `--grain 3`: grain strength. Use 0 for none.
 - `--denoise 1`: Real-ESRGAN's denoise strength.
