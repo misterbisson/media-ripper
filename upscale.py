@@ -1,19 +1,24 @@
 #!/usr/bin/env python3
 """Upscale a DVD rip to 1080p with Real-ESRGAN on the Neural Engine, plus film grain.
 
-Takes an MKV from ripdvd.py and writes "<name> - 1080p.mkv" beside it, which Plex
-and Jellyfin show as a second version of the same film. The video goes:
+Takes an MKV from ripdvd.py and writes "<name> - 1080p.m4v" beside it, which
+QuickTime plays and Plex and Jellyfin show as a second version of the same film.
+The video goes:
 
     ffmpeg decode → Real-ESRGAN general-x4v3, 4×, Core ML on the Neural Engine
     → resize to 1080p and add luma grain, PyTorch on the GPU → x265 10-bit
 
 and mkvmerge puts the new video together with the rip's audio, subtitles, chapters
-and frame timing, all untouched. A warm M2 MacBook Air manages about 4 frames a
-second, so 9 to 10 hours for a 90-minute film. The Mac is kept awake meanwhile.
+and frame timing. ffmpeg then moves all that into an MP4 that QuickTime can play:
+DTS and MP2 audio become AC3, and the DVD's subtitles, which are pictures, become
+text, read by macOS's own OCR (vobsub.py). A warm M2 MacBook Air manages about 4
+frames a second, so 9 to 10 hours for a 90-minute film. The Mac is kept awake
+meanwhile.
 
-Needs `brew install ffmpeg mkvtoolnix python@3.12`. On first use it offers to put
-PyTorch and coremltools (about 800 MB) in .venv/ beside it, and from then on runs
-itself with that. The model weights (4 MB each) download from Real-ESRGAN's GitHub
+Needs `brew install ffmpeg mkvtoolnix python@3.12`, and the Xcode command-line
+tools (`xcode-select --install`) to build the subtitle reader. On first use it
+offers to put PyTorch and coremltools (about 800 MB) in .venv/ beside it, and from
+then on runs itself with that. The model weights (4 MB each) download from Real-ESRGAN's GitHub
 releases, and are converted to Core ML once per frame size, in models/.
 
 Usage:
@@ -33,6 +38,7 @@ import multiprocessing
 import os
 import queue
 import shutil
+import struct
 import subprocess
 import sys
 import time
@@ -42,6 +48,8 @@ from datetime import datetime
 from fractions import Fraction
 from multiprocessing import shared_memory
 from pathlib import Path
+
+import vobsub
 
 HERE = Path(__file__).resolve().parent
 VENV = HERE / ".venv"
@@ -247,7 +255,142 @@ def mkvmerge(*args):
         sys.exit("mkvmerge failed")
 
 
+def streams(path):
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries",
+         "stream=index,codec_type,codec_name,channels:stream_tags=language,title"
+         ":stream_disposition=default,forced", "-of", "json", str(path)],
+        capture_output=True, text=True, check=True).stdout
+    return json.loads(out)["streams"]
+
+
+def read_subtitles(src, dst):
+    """OCR the rip's DVD subtitle tracks to .srt files beside `dst`, keyed by each
+    one's place among the rip's subtitle tracks. A track that reads as nothing is
+    left out. This runs before the upscale, so a problem shows up now, not hours on."""
+    srts = {}
+    subs = [s for s in streams(src) if s["codec_type"] == "subtitle"]
+    for k, s in enumerate(subs):
+        if s["codec_name"] != "dvd_subtitle":
+            continue
+        lang = s.get("tags", {}).get("language", "und")
+        cues = vobsub.read_track(src, s["index"], lang)
+        print(f"  subtitles: read {len(cues)} lines of track {k + 1} ({lang}) as text")
+        if cues:
+            srts[k] = dst.with_name(f"{dst.stem}.part-subs-{k}.srt")
+            vobsub.write_srt(cues, srts[k])
+    return srts
+
+
+# Audio QuickTime plays; it hides DTS and MP2 tracks in an MP4 without a word
+QUICKTIME_AUDIO = {"ac3", "eac3", "aac"}
+TEXT_SUBTITLES = {"subrip", "ass", "ssa", "mov_text", "webvtt"}
+
+
+def quicktime(mkv, srts, dst):
+    """Remux the finished MKV as an MP4 QuickTime plays: HEVC tagged hvc1 (it won't
+    open hev1, ffmpeg's default), audio it can't play as AC3, and subtitles as text."""
+    cmd = ["ffmpeg", "-v", "error", "-y", "-i", str(mkv)]
+    for path in srts.values():
+        cmd += ["-i", str(path)]
+    srt_input = {k: n for n, k in enumerate(srts, 1)}
+    cmd += ["-map_metadata", "0", "-map_chapters", "0"]
+    a = s = k = 0
+    for st in streams(mkv):
+        kind, codec, tags = st["codec_type"], st["codec_name"], st.get("tags", {})
+        if kind == "video":
+            cmd += ["-map", f"0:{st['index']}", "-c:v", "copy", "-tag:v", "hvc1"]
+        elif kind == "audio":
+            cmd += ["-map", f"0:{st['index']}"]
+            if codec in QUICKTIME_AUDIO:
+                cmd += [f"-c:a:{a}", "copy"]
+            else:
+                # AC3 holds at most 5.1, so DTS-ES 6.1 folds down. 5.1 gets AC3's
+                # top rate, as DTS starts out richer than a DVD's own AC3.
+                channels = min(st.get("channels", 2), 6)
+                # Named for where it came from, so it's told apart from the disc's
+                # own AC3 track of the same language and channels
+                name = f"{tags.get('title', 'Audio')} (from {codec.upper()})"
+                cmd += [f"-c:a:{a}", "ac3", f"-ac:a:{a}", str(channels),
+                        f"-b:a:{a}", "640k" if channels > 2 else "192k",
+                        f"-metadata:s:a:{a}", f"title={name}"]
+                print(f"  audio: {name} to AC3")
+            a += 1
+        elif kind == "subtitle":
+            k += 1
+            if k - 1 in srt_input:  # VobSub, read as text: the .srt in its place
+                disposition = st.get("disposition", {})
+                flags = "+".join(f for f in ("default", "forced") if disposition.get(f))
+                cmd += ["-map", f"{srt_input[k - 1]}:0", f"-disposition:s:{s}", flags or "0"]
+                for key in ("language", "title"):
+                    if key in tags:
+                        cmd += [f"-metadata:s:s:{s}", f"{key}={tags[key]}"]
+            elif codec in TEXT_SUBTITLES:
+                cmd += ["-map", f"0:{st['index']}"]
+            else:
+                continue
+            cmd += [f"-c:s:{s}", "mov_text"]
+            s += 1
+    # No +faststart: title_tracks() needs the index (moov) left at the end
+    cmd += ["-f", "mp4", str(dst)]
+    if subprocess.run(cmd).returncode:
+        sys.exit(f"ffmpeg couldn't make the MP4; the MKV is {mkv}")
+    title_tracks(dst)
+
+
+def mp4_children(data):
+    """(type, contents) of each box in an MP4 box's contents"""
+    at = 0
+    while at + 8 <= len(data):
+        size, kind = struct.unpack_from(">I4s", data, at)
+        if size < 8:
+            break
+        yield kind, data[at + 8:at + size]
+        at += size
+
+
+def mp4_box(kind, contents):
+    return struct.pack(">I4s", 8 + len(contents), kind) + contents
+
+
+def title_tracks(path):
+    """Give each track a 3GPP title (titl) beside the QuickTime name ffmpeg writes,
+    since QuickTime's menus show only the former: it's what tells "Commentary"
+    from "English 5.1". ffmpeg leaves the index (moov) last in the file, so it can
+    grow without moving anything else."""
+    def udta(contents):
+        parts = dict(mp4_children(contents))
+        if b"name" not in parts or b"titl" in parts:
+            return contents
+        # Version and flags, the language ("und", packed in 15 bits), the title
+        return contents + mp4_box(b"titl", bytes(4) + b"\x55\xc4" + parts[b"name"] + b"\0")
+
+    def trak(contents):
+        return b"".join(mp4_box(k, udta(c) if k == b"udta" else c)
+                        for k, c in mp4_children(contents))
+
+    with open(path, "r+b") as f:
+        size = f.seek(0, os.SEEK_END)
+        at, kind = 0, None
+        while at + 8 <= size:  # the top-level boxes: ftyp, free, mdat, moov
+            f.seek(at)
+            n, kind = struct.unpack(">I4s", f.read(8))
+            if n == 1:  # mdat's 64-bit size
+                n = struct.unpack(">Q", f.read(8))[0]
+            if kind == b"moov" or n < 8:
+                break
+            at += n
+        if kind != b"moov" or at + n != size:
+            return  # the index isn't last after all: leave the file be
+        moov = f.read(n - 8)
+        f.seek(at)
+        f.write(mp4_box(b"moov", b"".join(mp4_box(k, trak(c) if k == b"trak" else c)
+                                          for k, c in mp4_children(moov))))
+        f.truncate()
+
+
 def upscale(src, dst, args):
+    mp4 = dst.suffix.lower() != ".mkv"
     part = dst.with_name(dst.stem + ".part.mkv")
     video, times, window = (dst.with_name(dst.stem + s) for s in
                             (".part-video.mkv", ".part-times.txt", ".part-window.mkv"))
@@ -267,6 +410,7 @@ def upscale(src, dst, args):
 
     print(f"{src.name}: {w}×{h} → {out_w}×{out_h}, denoise {args.denoise}, "
           f"grain {args.grain}, x265 CRF {args.crf}, {total} frames")
+    srts = read_subtitles(src, dst) if mp4 else {}
     package = model_package(args.denoise, w, h)
     finish = Finisher(out_w, out_h, args.grain)
 
@@ -349,8 +493,14 @@ def upscale(src, dst, args):
     title = f"Real-ESRGAN {args.height}p" + (f" + grain {args.grain:g}" if args.grain else "")
     mkvmerge("-o", part, "--timestamps", f"0:{times}", "--track-name", f"0:{title}",
              "--default-track-flag", "0:yes", video, "--no-video", src)
-    part.rename(dst)
-    for f in (video, times, window):
+    if mp4:
+        part_mp4 = dst.with_name(dst.stem + ".part" + dst.suffix)
+        quicktime(part, srts, part_mp4)
+        part_mp4.rename(dst)
+        part.unlink()
+    else:
+        part.rename(dst)
+    for f in (video, times, window, *srts.values()):
         f.unlink(missing_ok=True)
     took = time.monotonic() - t0
     print(f"\nDone: {dst}  ({done} frames in {took / 60:.0f} min, {done / took:.2f} fps)")
@@ -502,7 +652,8 @@ def main():
     ap.add_argument("--setup", action="store_true", help="install PyTorch and coremltools, then exit")
     ap.add_argument("-y", "--yes", action="store_true", help="install them without asking")
     ap.add_argument("-o", "--output", type=Path,
-                    help='output file (default: "<input> - 1080p.mkv" beside it)')
+                    help='output file (default: "<input> - 1080p.m4v" beside it); '
+                         'a name ending .mkv skips the MP4 step')
     ap.add_argument("--height", type=int, default=1080, help="output height (default: 1080)")
     ap.add_argument("--grain", type=float, default=3,
                     help="grain strength in 8-bit code values, 0 for none (default: 3)")
@@ -515,7 +666,9 @@ def main():
     args = ap.parse_args()
 
     if args.setup:
-        print("ML upscaling is set up.")  # setup() ran before the venv took over
+        # setup() ran before the venv took over; this builds the subtitle reader
+        vobsub.ocr_tool()
+        print("ML upscaling is set up.")
         return
     if args.status:
         return show_status()
@@ -536,7 +689,7 @@ def main():
         options += ["-o", str(args.output.expanduser().resolve())] if args.output else []
         return enqueue(src, options)
     suffix = f" - {args.height}p" + (" sample" if args.sample else "")
-    dst = args.output or src.with_name(src.stem + suffix + ".mkv")
+    dst = args.output or src.with_name(src.stem + suffix + ".m4v")
     # Keep the Mac awake (but let the display sleep) until this process exits
     subprocess.Popen(["caffeinate", "-i", "-w", str(os.getpid())])
     upscale(src, dst, args)

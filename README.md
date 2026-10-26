@@ -21,7 +21,8 @@ brew install handbrake libdvdcss ffmpeg mkvtoolnix python@3.12
 
 `ripdvd.py` needs only Python 3.10+'s standard library. The ML upscaler also needs
 PyTorch and coremltools. The first time you use `--upscale`, it offers to install them
-into `.venv/` (about 800 MB, a couple of minutes).
+into `.venv/` (about 800 MB, a couple of minutes). It also builds a small subtitle
+reader, which needs the Xcode command-line tools (`xcode-select --install`).
 
 DVD drives are region-locked. A drive set to region 1 won't read a region 2 disc, and
 nothing in software gets around it. `ripdvd.py` says so when that's the problem. Use
@@ -65,8 +66,9 @@ keeps its own soundtrack. Tracks are named "English 5.1", "English Stereo", or
 **Subtitles.** English tracks are kept as selectable tracks, never burned in. DVD
 subtitles are VobSub: pictures of text, not text. MKV holds them as-is and VLC, IINA,
 Infuse, Kodi, Jellyfin and Plex all show them. MP4 effectively can't, which is the
-main reason the output is MKV. If you ever need text subtitles (`.srt`), OCR them
-afterwards with [Subtitle Edit](https://www.nikse.dk/subtitleedit) or `pgsrip`. When
+main reason the rip is MKV. The upscaler's MP4 gets them as text instead (see
+below). For text subtitles from any rip, `./vobsub.py film.mkv` writes an `.srt`
+for each track. When
 the film's original language isn't English, the first English track is turned on by
 default.
 
@@ -95,8 +97,9 @@ slow.
 
 `--upscale` hands each finished rip to `upscale.py` and goes on to the next disc. A
 background worker upscales queued films one at a time, at low priority so rips
-come first. It writes `Film (2006) - 1080p.mkv` beside the rip, and Jellyfin and Plex
-show that as a second version of the same film. Check the look first on one chapter:
+come first. It writes `Film (2006) - 1080p.m4v` beside the rip. That plays in
+QuickTime, and Jellyfin and Plex show it as a second version of the same film. Check
+the look first on one chapter:
 `./ripdvd.py --sample --upscale` upscales about 30 seconds of it.
 
 ```
@@ -127,6 +130,21 @@ The pipeline:
    unchanged. It also restores each frame's original timestamp. Rips are often
    variable frame rate: HandBrake returns film to 23.976 fps but leaves video-shot
    stretches at 29.97. Forcing one rate would drop or repeat frames there.
+6. ffmpeg moves it all into an MP4 that QuickTime plays:
+   - The HEVC is tagged `hvc1`. QuickTime won't open ffmpeg's default, `hev1`.
+   - AC3 audio is copied. DTS and MP2, which QuickTime hides without a word, become
+     AC3 (640 kbps for 5.1), named "English 5.1 (from DTS)" and the like.
+   - The DVD's subtitles become text. QuickTime can't show VobSub pictures, so
+     [`vobsub.py`](vobsub.py) decodes each picture and macOS's own OCR (Vision) reads
+     it. That runs before step 1, in a minute or two per film, so a problem shows up
+     before the hours of upscaling, not after. Check a film's subtitles once: OCR
+     can misread a word, and loses italics.
+   - Track names get a second copy in the box QuickTime's menus read, so
+     "Commentary" shows there as it does in Plex.
+
+   The MP4's index stays at the end of the file. That's fine for local playback and
+   for Plex and Jellyfin. Give `-o` a name ending `.mkv` to skip this step and get
+   step 5's MKV instead.
 
 Options for `./upscale.py` (`ripdvd.py --upscale` uses the defaults):
 
