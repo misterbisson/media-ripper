@@ -331,8 +331,11 @@ def quicktime(mkv, srts, dst):
                 continue
             cmd += [f"-c:s:{s}", "mov_text"]
             s += 1
-    # No +faststart: title_tracks() needs the index (moov) left at the end
-    cmd += ["-f", "mp4", str(dst)]
+    # No +faststart: title_tracks() needs the index (moov) left at the end. ffmpeg
+    # times the chapter track in the movie timescale, which it otherwise derives
+    # from the tracks' (10 MHz with text subtitles), and a chapter over 2^31 ticks
+    # (3.6 minutes at 10 MHz) is silently dropped. Milliseconds, as ffmpeg once did.
+    cmd += ["-movie_timescale", "1000", "-f", "mp4", str(dst)]
     if subprocess.run(cmd).returncode:
         sys.exit(f"ffmpeg couldn't make the MP4; the MKV is {mkv}")
     title_tracks(dst)
