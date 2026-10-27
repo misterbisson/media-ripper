@@ -91,8 +91,8 @@ def decode(spu, colors):
     """One subpicture → (show, hide, width, height, gray), the times in seconds
     after the packet's own (hide None when it doesn't say), and gray drawn as
     dark text on white: what Vision reads best. None if there's nothing to show."""
-    show = hide = rect = fields = None
-    index, alpha = [0, 1, 2, 3], [0, 15, 15, 15]
+    show = hide = fade = rect = fields = alpha = None
+    index = [0, 1, 2, 3]
     pos = struct.unpack_from(">H", spu, 2)[0]
     while True:
         delay, following = struct.unpack_from(">HH", spu, pos)
@@ -106,7 +106,13 @@ def decode(spu, colors):
             elif cmd == 3:
                 index = nibbles(spu[i + 1], spu[i + 2])
             elif cmd == 4:
-                alpha = nibbles(spu[i + 1], spu[i + 2])
+                # A fade steps the alpha up, then down to nothing: keep it at
+                # its most visible, and take the first step down as the end
+                step = nibbles(spu[i + 1], spu[i + 2])
+                if alpha is None or sum(step) > sum(alpha):
+                    alpha = step
+                elif sum(step) < sum(alpha) and fade is None:
+                    fade = delay * TICK
             elif cmd == 5:
                 b = spu[i + 1:i + 7]
                 rect = (b[0] << 4 | b[1] >> 4, (b[1] & 15) << 8 | b[2],
@@ -124,6 +130,8 @@ def decode(spu, colors):
         pos = following
     if rect is None or fields is None or show is None:
         return None
+    alpha = alpha or [0, 15, 15, 15]
+    hide = fade if hide is None else hide
     w, h = rect[1] - rect[0] + 1, rect[3] - rect[2] + 1
     if w <= 0 or h <= 0:
         return None
