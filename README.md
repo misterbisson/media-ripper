@@ -107,7 +107,16 @@ the look first on one chapter:
 ./upscale.py film.mkv                  # upscale a rip now, in this terminal
 ./upscale.py film.mkv --sample         # ~30 s from the middle
 ./upscale.py --enqueue film.mkv        # add a rip to the background queue
+./upscale.py --enqueue ~/"Movies/TV Shows/Show/Season 1/"*.m4v
 ```
+
+It isn't only for rips: give it any standard-definition video ffmpeg reads, such
+as an old iTunes download or a TV recording, and it keeps that file's cover art,
+chapters, and its title, show, season and episode. Copy-protected iTunes Store
+purchases can't be read, and `--enqueue` says so and skips them. At 9 to 10 hours
+a film (below), choose what's worth it: a season of a show is a week of nights.
+Check the look on one first with `--sample`. The settings were tuned on DVDs, and
+a small, heavily compressed download is a different kind of damaged.
 
 The queue lives in `~/Library/Application Support/media-ripper/`, and the log is
 `~/Library/Logs/media-ripper/upscale.log`. If the Mac restarts mid-film, that film
@@ -118,7 +127,8 @@ stays queued: the next `--enqueue` starts a worker again, or run
 
 The pipeline:
 
-1. ffmpeg decodes the rip.
+1. ffmpeg decodes the rip, deinterlacing frames that are marked interlaced (TV
+   recordings; HandBrake has already done a rip's).
 2. Real-ESRGAN general-x4v3 upscales 4× on the Neural Engine. On first use it downloads
    the 4 MB weights. It converts them to Core ML for each new frame size, which varies
    with how HandBrake cropped the letterbox bars. That takes a minute or two once per
@@ -126,14 +136,17 @@ The pipeline:
 3. The GPU resizes to 1080p at the film's real aspect ratio, with square pixels, and adds
    luma grain.
 4. x265 encodes 10-bit HEVC.
-5. mkvmerge puts it together with the rip's audio, subtitles, chapters and track flags,
-   unchanged. It also restores each frame's original timestamp. Rips are often
-   variable frame rate: HandBrake returns film to 23.976 fps but leaves video-shot
-   stretches at 29.97. Forcing one rate would drop or repeat frames there.
-6. ffmpeg moves it all into an MP4 that QuickTime plays:
+5. mkvmerge restores each frame's original timestamp. Rips are often variable frame
+   rate: HandBrake returns film to 23.976 fps but leaves video-shot stretches at
+   29.97. Forcing one rate would drop or repeat frames there.
+6. [`quicktime.py`](quicktime.py) puts the new video in an MP4 that QuickTime plays,
+   with everything else from the source: audio, subtitles, chapters, cover art,
+   tags, and track names and flags.
    - The HEVC is tagged `hvc1`. QuickTime won't open ffmpeg's default, `hev1`.
-   - AC3 audio is copied. DTS and MP2, which QuickTime hides without a word, become
-     AC3 (640 kbps for 5.1), named "English 5.1 (from DTS)" and the like.
+   - AAC, AC3 and ALAC audio is copied. The rest becomes AAC, or AC3 (640 kbps)
+     above stereo: DTS and MP2, which QuickTime hides without a word, MP3, which it
+     drops from an MP4, and old QuickTime codecs macOS no longer decodes. A named
+     track is renamed for where it came from, as "English 5.1 (from DTS)".
    - The DVD's subtitles become text. QuickTime can't show VobSub pictures, so
      [`vobsub.py`](vobsub.py) decodes each picture and macOS's own OCR (Vision) reads
      it. That runs before step 1, in a minute or two per film, so a problem shows up
@@ -143,8 +156,35 @@ The pipeline:
      "Commentary" shows there as it does in Plex.
 
    The MP4's index stays at the end of the file. That's fine for local playback and
-   for Plex and Jellyfin. Give `-o` a name ending `.mkv` to skip this step and get
-   step 5's MKV instead.
+   for Plex and Jellyfin. For a rip, give `-o` a name ending `.mkv` to skip this
+   step and get an MKV of the new video and the rip's other tracks instead.
+
+## Old videos that no longer play
+
+macOS has dropped the codecs much early QuickTime video used. On macOS 27:
+
+| Plays | Doesn't |
+|---|---|
+| H.264, HEVC, MPEG-4 Part 2, H.263, MPEG-1 and -2, Motion JPEG | Sorenson Video, Cinepak, Apple Video, DivX, and anything in AVI, WMV or FLV |
+| AAC, AC3, ALAC, IMA4 | QDesign (QDM2), Microsoft ADPCM, and MP3 or DTS inside an MP4 |
+
+[`transcode.py`](transcode.py) writes an `.m4v` that plays beside each video it's
+given, at the video's own size, and leaves the original alone. It needs only ffmpeg
+(and the Xcode command-line tools for DVD subtitles).
+
+```
+./transcode.py "Old Trailer.mov"
+./transcode.py ~/Movies/Clips/*.avi
+```
+
+H.264 and HEVC video is copied, and anything older becomes H.264 (x264 CRF 18, set
+with `--crf`). Audio, subtitles, chapters, cover art and tags go through the same
+step 6 as an upscale. A file that's already `.m4v` gets `<name> - QuickTime.m4v`,
+and one made before is left alone without `--force`. Copy-protected iTunes Store
+purchases are skipped, with a note saying so.
+
+To upscale an old video instead, give it to `upscale.py`: the result plays too.
+Transcoding is for video too small for an upscale to help, or already HD.
 
 Options for `./upscale.py` (`ripdvd.py --upscale` uses the defaults):
 
