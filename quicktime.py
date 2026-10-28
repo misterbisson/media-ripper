@@ -7,7 +7,7 @@ the rest is copied:
   is copied, and anything older becomes H.264 at its own size.
 - Audio: AAC, AC3, E-AC3 and ALAC are copied. DTS, MP2, MP3 (which QuickTime
   drops from an MP4 without a word) and the QuickTime-era codecs that macOS no
-  longer decodes (QDesign, MACE, ADPCM) become AAC, or AC3 above stereo.
+  longer decodes (QDesign, ADPCM) become AAC, or AC3 above stereo.
 - Subtitles: text stays text, and DVD subtitles, which are pictures, become text
   through macOS's own OCR (vobsub.py).
 - Chapters, cover art, track names and flags, and the title, show, season,
