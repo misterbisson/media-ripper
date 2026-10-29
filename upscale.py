@@ -224,11 +224,19 @@ class Finisher:
 # ---------------------------------------------------------------- video
 
 def probe(path):
-    out = subprocess.run(
-        ["ffprobe", "-v", "error", "-select_streams", "V:0", "-show_entries",
-         "stream=width,height,sample_aspect_ratio,r_frame_rate,color_space:format=duration",
-         "-of", "json", str(path)], capture_output=True, text=True, check=True).stdout
-    d = json.loads(out)
+    # MPEG program streams (.mpg) have no header listing their streams: ffprobe
+    # finds them by reading packets, so a network volume that stalls for a moment
+    # gets a clean exit and no streams. Try again before giving up.
+    for _ in range(3):
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "V:0", "-show_entries",
+             "stream=width,height,sample_aspect_ratio,r_frame_rate,color_space:format=duration",
+             "-of", "json", str(path)], capture_output=True, text=True, check=True).stdout
+        if (d := json.loads(out))["streams"]:
+            break
+        time.sleep(5)
+    else:
+        sys.exit(f"ffprobe found no video stream in {path}")
     s = d["streams"][0]
     # Counting packets reads the whole file, but only demuxes: seconds, not minutes
     frames = json.loads(subprocess.run(
