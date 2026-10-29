@@ -127,8 +127,8 @@ stays queued: the next `--enqueue` starts a worker again, or run
 
 The pipeline:
 
-1. ffmpeg decodes the rip, deinterlacing frames that are marked interlaced (TV
-   recordings; HandBrake has already done a rip's).
+1. ffmpeg decodes the rip, and deinterlaces it if it's interlaced (see
+   [Interlacing](#interlacing); HandBrake has already done a rip's).
 2. Real-ESRGAN general-x4v3 upscales 4× on the Neural Engine. On first use it downloads
    the 4 MB weights. It converts them to Core ML for each new frame size, which varies
    with how HandBrake cropped the letterbox bars. That takes a minute or two once per
@@ -159,39 +159,14 @@ The pipeline:
    for Plex and Jellyfin. For a rip, give `-o` a name ending `.mkv` to skip this
    step and get an MKV of the new video and the rip's other tracks instead.
 
-## Old videos that no longer play
-
-macOS has dropped the codecs much early QuickTime video used. On macOS 27:
-
-| Plays | Doesn't |
-|---|---|
-| H.264, HEVC, MPEG-4 Part 2, H.263, MPEG-1 and -2, Motion JPEG | Sorenson Video, Cinepak, Apple Video, DivX, and anything in AVI, WMV or FLV |
-| AAC, AC3, ALAC, IMA4 | QDesign (QDM2), Microsoft ADPCM, and MP3 or DTS inside an MP4 |
-
-[`transcode.py`](transcode.py) writes an `.m4v` that plays beside each video it's
-given, at the video's own size, and leaves the original alone. It needs only ffmpeg
-(and the Xcode command-line tools for DVD subtitles).
-
-```
-./transcode.py "Old Trailer.mov"
-./transcode.py ~/Movies/Clips/*.avi
-```
-
-H.264 and HEVC video is copied, and anything older becomes H.264 (x264 CRF 18, set
-with `--crf`). Audio, subtitles, chapters, cover art and tags go through the same
-step 6 as an upscale. A file that's already `.m4v` gets `<name> - QuickTime.m4v`,
-and one made before is left alone without `--force`. Copy-protected iTunes Store
-purchases are skipped, with a note saying so.
-
-To upscale an old video instead, give it to `upscale.py`: the result plays too.
-Transcoding is for video too small for an upscale to help, or already HD.
-
 Options for `./upscale.py` (`ripdvd.py --upscale` uses the defaults):
 
 - `--grain 3`: grain strength. Use 0 for none.
 - `--denoise 1`: Real-ESRGAN's denoise strength.
 - `--crf 21` and `--preset medium`: x265 quality and speed.
 - `--height`: output height, 1080 by default.
+- `--fields`: `interlaced`, `telecined` or `progressive`, when the automatic
+  choice ([Interlacing](#interlacing)) gets a video wrong.
 
 The Mac stays awake while it runs, and progress shows frames per second and time left.
 
@@ -273,3 +248,53 @@ Grain costs bitrate. On the close-up face clip, grain 3 versus none:
 x265 keeps the grain for about twice the bits of a clean picture. AV1 smears half of it
 away, and SVT-AV1's grain synthesis (`film-grain=8:film-grain-denoise=1`; denoising is off
 by default) underestimates grain this fine, so it doesn't bring much back.
+
+## Old videos that no longer play
+
+macOS has dropped the codecs much early QuickTime video used. On macOS 27:
+
+| Plays | Doesn't |
+|---|---|
+| H.264, HEVC, MPEG-4 Part 2, H.263, MPEG-1 and -2, Motion JPEG | Sorenson Video, Cinepak, Apple Video, DivX, and anything in AVI, WMV or FLV |
+| AAC, AC3, ALAC, IMA4 | QDesign (QDM2), Microsoft ADPCM, and MP3 or DTS inside an MP4 |
+
+[`transcode.py`](transcode.py) writes an `.m4v` that plays beside each video it's
+given, at the video's own size, and leaves the original alone. It needs only ffmpeg
+(and the Xcode command-line tools for DVD subtitles).
+
+```
+./transcode.py "Old Trailer.mov"
+./transcode.py ~/Movies/Clips/*.avi
+```
+
+H.264 and HEVC video is copied, and anything older becomes H.264 (x264 CRF 18, set
+with `--crf`), deinterlaced if need be (below). Audio, subtitles, chapters, cover art and tags go through the same
+step 6 as an upscale. A file that's already `.m4v` gets `<name> - QuickTime.m4v`,
+and one made before is left alone without `--force`. Copy-protected iTunes Store
+purchases are skipped, with a note saying so.
+
+To upscale an old video instead, give it to `upscale.py`: the result plays too.
+Transcoding is for video too small for an upscale to help, or already HD.
+
+### Interlacing
+
+TV is interlaced: each frame is two fields, the odd lines and the even lines, shot
+1/60 s apart. Shown as whole frames, as on a computer or a modern TV, anything
+moving gets comb-like stripes along its edges. Film shown on TV was spread from 24
+frames a second over 30 interlaced ones by 3:2 pulldown, which shows the stripes in
+2 frames of every 5. TV recordings and old downloads seldom say which they are, so
+`upscale.py` and `transcode.py` look, with ffmpeg's `idet`, at 8 stretches spread
+through the video:
+
+- Interlaced: each frame is rebuilt from its two fields (`bwdif`), at the same
+  frame rate.
+- Film with pulldown: the film's own frames are matched back up from their fields,
+  and the frame in 5 the pulldown added is dropped, so it's 24 frames a second
+  again, whole. This needs the pattern of repeated fields to show, which takes
+  movement. A film that's mostly still, or so compressed that the repeats are lost,
+  is deinterlaced instead, which also removes the stripes.
+- Progressive: left alone, apart from any frames marked interlaced.
+
+The log and the terminal say which it chose. If that's wrong, `--fields` says so
+instead, and `transcode.py --fields interlaced` re-encodes an H.264 or HEVC video
+it would otherwise copy.

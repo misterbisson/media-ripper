@@ -6,7 +6,10 @@ DivX, and QDesign or ADPCM sound, from QuickTime's early days), or in containers
 it never opened (AVI, WMV), and for video that's merely old. It writes
 "<name>.m4v" beside the original, which it leaves alone:
 
-- H.264 and HEVC video is copied; anything else becomes H.264 (x264 CRF 18).
+- H.264 and HEVC video is copied; anything else becomes H.264 (x264 CRF 18),
+  deinterlaced if it's interlaced, and back at 24 frames a second if it's film
+  with 3:2 pulldown, both found by looking. --fields says which instead, and
+  with it H.264 and HEVC are re-encoded too.
 - Audio QuickTime plays is copied; the rest becomes AAC, or AC3 above stereo.
 - Text subtitles, chapters, cover art, and the title, show, season and episode
   an iTunes file carries, come along. DVD subtitles become text (vobsub.py).
@@ -18,6 +21,7 @@ Usage:
     ./transcode.py "Old Trailer.mov"
     ./transcode.py ~/Movies/Clips/*.avi
     ./transcode.py film.mp4 --crf 20
+    ./transcode.py "TV recording.mp4" --fields interlaced
 """
 
 import argparse
@@ -42,7 +46,7 @@ def transcode(src, args):
     srts = quicktime.read_subtitles(src, dst)
     part = dst.with_name(dst.stem + ".part" + dst.suffix)
     try:
-        quicktime.make_mp4(src, part, srts, crf=args.crf, preset=args.preset)
+        quicktime.make_mp4(src, part, srts, crf=args.crf, preset=args.preset, fields=args.fields)
         part.rename(dst)
     finally:
         for f in (part, *srts.values()):
@@ -55,6 +59,9 @@ def main():
     ap.add_argument("--crf", type=float, default=18,
                     help="x264 quality for video that's re-encoded, lower is better (default: 18)")
     ap.add_argument("--preset", default="slow", help="x264 preset (default: slow)")
+    ap.add_argument("--fields", choices=("auto", *quicktime.FIELDS), default="auto",
+                    help="whether the video is interlaced, or film with 3:2 pulldown "
+                         "(default: auto, found by looking at video that's re-encoded)")
     ap.add_argument("-f", "--force", action="store_true", help="replace an .m4v made before")
     args = ap.parse_args()
     if not shutil.which("ffmpeg"):

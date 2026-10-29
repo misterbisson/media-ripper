@@ -4,7 +4,8 @@ upscale.py and transcode.py both end here. What QuickTime can't play is converte
 the rest is copied:
 
 - Video: HEVC is tagged hvc1 (QuickTime won't open ffmpeg's default, hev1), H.264
-  is copied, and anything older becomes H.264 at its own size.
+  is copied, and anything older becomes H.264 at its own size, deinterlaced if
+  it's interlaced (fields()).
 - Audio: AAC, AC3, E-AC3 and ALAC are copied. DTS, MP2, MP3 (which QuickTime
   drops from an MP4 without a word) and the QuickTime-era codecs that macOS no
   longer decodes (QDesign, ADPCM) become AAC, or AC3 above stereo.
@@ -64,6 +65,90 @@ def attached(stream):
     return stream.get("disposition", {}).get("attached_pic")
 
 
+FIELDS = ("progressive", "interlaced", "telecined")
+
+
+def fields(path, frames=250, windows=8):
+    """How the picture is interlaced, found by looking, since TV captures and old
+    downloads seldom say: ("progressive", None), or ("interlaced" or "telecined",
+    "tff" or "bff", the field shown first). Telecined is film, 24 frames a second
+    spread over 30 interlaced ones by 3:2 pulldown, whose frames can be put back
+    together whole. ffmpeg's idet reads `frames` frames at each of `windows`
+    places through the file."""
+    duration = float(json.loads(subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json",
+         str(path)], capture_output=True, text=True, check=True).stdout)["format"].get("duration", 0))
+    seen = dict.fromkeys(("TFF", "BFF", "Progressive"), 0)
+    pulldown = stray = 0
+    for n in range(windows):
+        out = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-nostats", "-ss", f"{duration * (n + 0.5) / windows:.3f}",
+             "-i", str(path), "-map", "0:V:0", "-frames:v", str(frames),
+             "-vf", "idet,metadata=print:key=lavfi.idet.repeated.current_frame:file=-",
+             "-f", "null", "-"], capture_output=True, text=True)
+        for line in out.stderr.splitlines():
+            # Multi-frame detection, which weighs each frame's neighbors, is
+            # steadier than single-frame
+            if "Multi frame detection:" in line:
+                words = line.split(":", 1)[1].replace(":", " ").split()
+                for key, count in zip(words[::2], words[1::2]):
+                    if key in seen:
+                        seen[key] += int(count)
+        # Pulldown repeats a top field in one frame of every 5 and a bottom field
+        # in another. Lossy compression hides many repeats, and a still picture
+        # shows them anywhere, so what counts is how many fall in that cadence.
+        repeats = [line.rpartition("=")[2] for line in out.stdout.splitlines()
+                   if "repeated.current_frame=" in line]
+        for field in ("top", "bottom"):
+            at = [i % 5 for i, r in enumerate(repeats) if r == field]
+            best = max((at.count(k) for k in range(5)), default=0)
+            pulldown += best
+            stray += len(at) - best
+    combed = seen["TFF"] + seen["BFF"]
+    judged = combed + seen["Progressive"]
+    if not judged or combed < judged / 4:
+        return "progressive", None
+    order = "tff" if seen["TFF"] >= seen["BFF"] else "bff"
+    # In the cadence for a tenth of the 2-in-5 frames where pulldown repeats a
+    # field, and seldom out of it. Film missed as pulldown is still deinterlaced.
+    if pulldown >= judged * 2 / 5 / 10 and pulldown >= 4 * stray:
+        return "telecined", order
+    return "interlaced", order
+
+
+def picture(path, kind="auto"):
+    """fields(), or `kind` as given, with the field order found by looking (top
+    first if none shows)."""
+    if kind == "progressive":
+        return kind, None
+    found, order = fields(path)
+    return (found, order) if kind == "auto" else (kind, order or "tff")
+
+
+def describe(kind, order):
+    if kind == "progressive":
+        return "progressive"
+    return {"interlaced": f"interlaced ({order.upper()}): deinterlacing",
+            "telecined": f"film with 3:2 pulldown ({order.upper()}): back to 24 frames a second",
+            }[kind]
+
+
+def field_filter(kind, order):
+    """The ffmpeg filters that make whole frames of a picture `fields()` found to
+    be `kind`. Interlaced: each frame from both its fields (bwdif), at the same
+    frame rate. Telecined: the film's frames matched back up from their fields,
+    and the 1 in 5 that pulldown added dropped, so 30 a second become 24; any
+    left combed, as across an edit, are deinterlaced."""
+    if kind == "interlaced":
+        return f"bwdif=mode=send_frame:parity={order}:deint=all"
+    if kind == "telecined":
+        return (f"fieldmatch=order={order},"
+                f"bwdif=mode=send_frame:parity={order}:deint=interlaced,decimate")
+    # A rip's frames are whole already (HandBrake deinterlaces); any still marked
+    # interlaced are deinterlaced, as before this looked
+    return "bwdif=mode=send_frame:deint=interlaced"
+
+
 def read_subtitles(src, dst):
     """OCR the source's DVD subtitle tracks to .srt files beside `dst`, keyed by
     each one's place among its subtitle tracks. A track that reads as nothing is
@@ -82,13 +167,16 @@ def read_subtitles(src, dst):
     return srts
 
 
-def make_mp4(src, dst, srts=None, video=None, video_title=None, hd=None, crf=18, preset="slow"):
+def make_mp4(src, dst, srts=None, video=None, video_title=None, hd=None, crf=18, preset="slow",
+             fields="auto"):
     """Write `src` to `dst` as an MP4 QuickTime plays.
 
     `video` replaces the source's own picture with the first video track of that
     file (an upscale), which must share the source's timeline. `srts` are the
     source's DVD subtitles as text, from read_subtitles(). `hd` sets the iTunes
-    HD flag: 1 for 720p, 2 for 1080p. Old video is encoded as x264 at `crf`."""
+    HD flag: 1 for 720p, 2 for 1080p. Old video is encoded as x264 at `crf`,
+    deinterlaced as `fields` says or, on "auto", as picture() finds; H.264 and
+    HEVC are copied as they are, unless `fields` says they're interlaced."""
     srts = srts or {}
     cmd = ["ffmpeg", "-v", "error", "-y"]
     if video:
@@ -120,15 +208,15 @@ def make_mp4(src, dst, srts=None, video=None, video_title=None, hd=None, crf=18,
     else:
         cmd += ["-map", f"{s_in}:{pictures[0]['index']}"]
         codec = pictures[0]["codec_name"]
-        if codec in ("h264", "hevc"):
+        if codec in ("h264", "hevc") and fields in ("auto", "progressive"):
             cmd += ["-c:v:0", "copy", "-tag:v:0", "avc1" if codec == "h264" else "hvc1"]
         else:
-            # Deinterlaces only the frames marked interlaced (MPEG-2 from TV or a
-            # DVD); even dimensions, as x264 needs, keeping the display shape
-            cmd += ["-filter:v:0", "bwdif=mode=send_frame:deint=interlaced,scale=trunc(iw/2)*2:trunc(ih/2)*2",
+            kind, order = picture(src, fields)
+            # Even dimensions, as x264 needs, keeping the display shape
+            cmd += ["-filter:v:0", f"{field_filter(kind, order)},scale=trunc(iw/2)*2:trunc(ih/2)*2",
                     "-c:v:0", "libx264", "-crf", str(crf), "-preset", preset,
                     "-pix_fmt", "yuv420p", "-fps_mode", "passthrough"]
-            print(f"  video: {codec} to H.264")
+            print(f"  video: {codec} to H.264, {describe(kind, order)}")
     v = 1
     for st in found:
         if attached(st) and st["codec_name"] in ("mjpeg", "png"):

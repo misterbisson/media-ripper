@@ -13,7 +13,8 @@ and mkvmerge puts the source's frame timing back on it. quicktime.py then puts i
 in an MP4 with the source's audio, subtitles, chapters, cover art and tags, in
 forms QuickTime plays: audio it can't play becomes AAC, or AC3 above stereo, and
 a DVD's subtitles, which are pictures, become text, read by macOS's own OCR
-(vobsub.py). Frames marked interlaced are deinterlaced first. A warm M2 MacBook
+(vobsub.py). Interlaced video, found by looking, is deinterlaced first, and film
+put on video with 3:2 pulldown goes back to its own 24 frames a second. A warm M2 MacBook
 Air manages about 4 frames a second, so 9 to 10 hours for a 90-minute film. The
 Mac is kept awake meanwhile. Copy-protected iTunes Store purchases can't be read,
 and are refused.
@@ -91,7 +92,7 @@ def setup(yes=False):
 
 # Run as a script with any python3, this sets up .venv if need be and re-runs
 # itself there, before importing anything that only the venv has.
-if __name__ == "__main__" and Path(sys.prefix).resolve() != VENV:
+if __name__ == "__main__" and Path(sys.prefix).resolve() != VENV.resolve():
     setup(yes="--yes" in sys.argv or "-y" in sys.argv)
     venv_python = str(VENV / "bin" / "python")
     os.execv(venv_python, [venv_python, str(HERE / "upscale.py"), *sys.argv[1:]])
@@ -291,9 +292,13 @@ def upscale(src, dst, args):
     w, h = info["w"], info["h"]
     out_w, out_h = output_size(info, args.height)
     rate, total = info["rate"], info["frames"]
+    kind, order = quicktime.picture(src, args.fields)
+    if kind == "telecined":  # 1 frame in 5 goes
+        rate, total = str(Fraction(rate) * 4 / 5), total * 4 // 5
 
     print(f"{src.name}: {w}×{h} → {out_w}×{out_h}, denoise {args.denoise}, "
           f"grain {args.grain}, x265 CRF {args.crf}, {total} frames")
+    print(f"  picture: {quicktime.describe(kind, order)}")
     srts = quicktime.read_subtitles(src, dst) if mp4 else {}
     package = model_package(args.denoise, w, h)
     finish = Finisher(out_w, out_h, args.grain)
@@ -301,14 +306,17 @@ def upscale(src, dst, args):
     # Rips are often variable frame rate: HandBrake turns film back into 23.976 fps
     # but leaves video-shot stretches at 29.97. Raw frames lose their timestamps on
     # the way through the model, so the decoder also writes each frame's timestamp
-    # to a file, and mkvmerge puts them back on the encoded video. Frames marked
-    # interlaced (MPEG-2 from TV; HandBrake has already done a rip's) are
-    # deinterlaced first, which the model can't do.
-    passthrough = ["-fps_mode", "passthrough", "-enc_time_base", "demux"]
-    decode_cmd = ["ffmpeg", "-v", "error", "-y", "-i", str(src), "-map", "0:V:0",
-                  "-vf", f"bwdif=mode=send_frame:deint=interlaced,scale=in_color_matrix={info['matrix']}",
-                  *passthrough, "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
-                  "-map", "0:V:0", "-c:v", "wrapped_avframe", *passthrough,
+    # to a file, and mkvmerge puts them back on the encoded video. Interlaced
+    # video (HandBrake has already done a rip's) is deinterlaced first, which
+    # the model can't do, and the times are those of the frames that come out:
+    # pulldown's are 24 a second, which the source's own clock can't hold.
+    passthrough = ["-fps_mode", "passthrough",
+                   "-enc_time_base", "filter" if kind == "telecined" else "demux"]
+    decode_cmd = ["ffmpeg", "-v", "error", "-y", "-i", str(src), "-filter_complex",
+                  f"[0:V:0]{quicktime.field_filter(kind, order)},split[pic][time];"
+                  f"[pic]scale=in_color_matrix={info['matrix']}[rgb]",
+                  "-map", "[rgb]", *passthrough, "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
+                  "-map", "[time]", "-c:v", "wrapped_avframe", *passthrough,
                   "-f", "mkvtimestamp_v2", str(times)]
     encoder = subprocess.Popen(
         ["ffmpeg", "-v", "error", "-y",
@@ -551,6 +559,9 @@ def main():
                     help="Real-ESRGAN denoise strength, 0 to 1 (default: 1)")
     ap.add_argument("--crf", type=float, default=21, help="x265 quality, lower is better (default: 21)")
     ap.add_argument("--preset", default="medium", help="x265 preset (default: medium)")
+    ap.add_argument("--fields", choices=("auto", *quicktime.FIELDS), default="auto",
+                    help="whether the video is interlaced, or film with 3:2 pulldown "
+                         "(default: auto, found by looking)")
     ap.add_argument("--sample", action="store_true",
                     help=f"only {SAMPLE_SECS} s from the middle, to check settings")
     args = ap.parse_args()
@@ -577,7 +588,8 @@ def main():
             sys.exit(f"{tool} not found: brew install {package}")
     if args.enqueue:
         options = ["--height", str(args.height), "--grain", str(args.grain),
-                   "--denoise", str(args.denoise), "--crf", str(args.crf), "--preset", args.preset]
+                   "--denoise", str(args.denoise), "--crf", str(args.crf), "--preset", args.preset,
+                   "--fields", args.fields]
         options += ["--sample"] if args.sample else []
         options += ["-o", str(args.output.expanduser().resolve())] if args.output else []
         return enqueue(srcs, options)
