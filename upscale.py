@@ -225,18 +225,12 @@ class Finisher:
 # ---------------------------------------------------------------- video
 
 def probe(path):
-    # MPEG program streams (.mpg) have no header listing their streams: ffprobe
-    # finds them by reading packets, so a network volume that stalls for a moment
-    # gets a clean exit and no streams. Try again before giving up.
-    for _ in range(3):
-        out = subprocess.run(
-            ["ffprobe", "-v", "error", "-select_streams", "V:0", "-show_entries",
-             "stream=width,height,sample_aspect_ratio,r_frame_rate,color_space:format=duration",
-             "-of", "json", str(path)], capture_output=True, text=True, check=True).stdout
-        if (d := json.loads(out))["streams"]:
-            break
-        time.sleep(5)
-    else:
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "V:0", "-show_entries",
+         "stream=width,height,sample_aspect_ratio,r_frame_rate,color_space:format=duration",
+         "-of", "json", str(path)], capture_output=True, text=True, check=True).stdout
+    d = json.loads(out)
+    if not d["streams"]:
         sys.exit(f"ffprobe found no video stream in {path}")
     s = d["streams"][0]
     # Counting packets reads the whole file, but only demuxes: seconds, not minutes
@@ -273,12 +267,16 @@ def upscale(src, dst, args):
     part = dst.with_name(dst.stem + ".part" + dst.suffix)
     video, timed, times = (dst.with_name(dst.stem + s) for s in
                            (".part-video.mkv", ".part-timed.mkv", ".part-times.txt"))
-    window = dst.with_name(dst.stem + ".part-window" + src.suffix)
+    # MPEG program streams (.mpg) say nothing about their tracks but what's in the
+    # packets, and ffmpeg's copy of one can lose the video: ffprobe then takes it
+    # for MP3. mkvmerge reads them too, and writes each track's codec in the header.
+    by_mkvmerge = src.suffix.lower() in (".mkv", ".mpg", ".mpeg")
+    window = dst.with_name(dst.stem + ".part-window" + (".mkv" if by_mkvmerge else src.suffix))
     if args.sample:
         # Cut every track from the middle and treat that as the film. Both start
         # at the next keyframe, so the sample can come out a little short.
         mid = probe(src)["duration"] / 2
-        if src.suffix.lower() == ".mkv":
+        if by_mkvmerge:
             mkvmerge("-o", window, "--split",
                      f"parts:{(mid - SAMPLE_SECS / 2) * 1000:.0f}ms-{(mid + SAMPLE_SECS / 2) * 1000:.0f}ms",
                      src)
