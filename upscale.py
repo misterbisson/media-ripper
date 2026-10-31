@@ -484,6 +484,9 @@ def worker_running():
 def run_queue():
     # Below rips and everything else, which get the CPU first
     os.nice(10)
+    # A worker outlives the terminal that started it, and torch can't be imported
+    # from a directory that's since been deleted. Jobs hold absolute paths.
+    os.chdir(HERE)
     STATE.mkdir(parents=True, exist_ok=True)
     while True:
         with open(LOCK, "a") as lock:
