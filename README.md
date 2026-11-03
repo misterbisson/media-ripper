@@ -298,3 +298,95 @@ through the video:
 The log and the terminal say which it chose. If that's wrong, `--fields` says so
 instead, and `transcode.py --fields interlaced` re-encodes an H.264 or HEVC video
 it would otherwise copy.
+
+## Two copies of one film, or several episodes in one file
+
+A library collected over years ends up with the same film more than once, and the
+copies often aren't interchangeable: one has the original language with English
+burned into the picture and the other a dub with a clean picture, or one is the film
+and the other the same picture with a commentary in place of its sound. Discarding
+either loses something. Two tools put them together instead. A third takes apart
+something the same libraries hold: a disc's "play all" title, or a whole series in
+one download. None of them changes the files it's given. Each writes new ones.
+
+### Burned-in subtitles, as text
+
+[`burnedsubs.py`](burnedsubs.py) needs a clean copy of the same picture: same cut,
+same size, starting together. Decoding the two side by side, what differs in the
+lower third of the frame is the subtitle and nothing else, so each one is found and
+timed to 0.2 s without guessing where it is. macOS's OCR (the same reader
+`vobsub.py` uses) reads each subtitle twice, once from the difference and once from
+the subtitled frames with everything else blanked, and keeps the reading that looks
+more like words.
+
+```
+./burnedsubs.py "Film (subtitled).m4v" "Film.m4v"                      # Film (subtitled).eng.srt
+./burnedsubs.py "Film (subtitled).m4v" "Film.m4v" --start 600 --length 300   # a 5-minute trial
+./burnedsubs.py "Film (subtitled).m4v" "Film.m4v" --pictures review/
+```
+
+Beside the `.srt` it writes `.review.txt`: every line where the two readings
+disagree, with both. Those are the lines to check, and `--pictures` writes their
+frames to check them against. On three films with burned-in English and a clean
+dub, 34 of 36 randomly sampled lines came out exactly right on each film, and 29 to
+143 lines a film were flagged for review. The misses are small: a wrong letter
+(`Bee` for `See`), a name the language correction turned into a word, a dropped
+apostrophe. Two subtitles that follow straight on from each other came out as
+nonsense until each frame was compared with the one before, rather than with the
+whole subtitle so far. Without a clean copy this hasn't been tried. It needs numpy,
+which the upscaler's `.venv` has; it uses that if it's there.
+
+### Sound tracks from several files, in one
+
+[`addtracks.py`](addtracks.py) puts the sound of other copies, and an `.srt`, beside
+one file's picture. Nothing is re-encoded. QuickTime offers the tracks in its Audio
+and Subtitles menus, named as given.
+
+```
+./addtracks.py --picture "Film.m4v" \
+    --sound "Film.m4v" eng "English" \
+    --sound "Film (commentary).m4v" eng "Director's commentary" \
+    --out "Film - with commentary.m4v"
+./addtracks.py --picture "Film (dubbed).m4v" \
+    --sound "Film (subtitled).m4v" fra "French" \
+    --sound "Film (dubbed).m4v" eng "English dub" \
+    --subtitles "Film (subtitled).eng.srt" eng "English" \
+    --tags-from "Film (subtitled).m4v" --out "Film - French and English.m4v"
+```
+
+The first `--sound` is the one a player starts with. Before writing, it checks that
+each added track keeps time with the picture file's own sound, at three places
+through the film: a commentary sits over the film's own sound, and a dub keeps its
+music and effects, so the two correlate. Six pairs kept time within 0.14 s at all
+three, with no drift. A commentary from a different film was off by seconds and
+refused. `--no-check` skips the check, for sound with nothing in common.
+
+Chapters and cover art come from `--picture`, and tags from `--tags-from`: the copy
+with the better picture is often the one whose tags say least.
+
+A foreign film combined this way may start with no subtitles showing. AVFoundation
+names a text track's default *English Forced*, which shows only lines marked forced,
+so someone has to pick *English* once. And a player that never offers a choice of
+track plays only the first.
+
+### Several episodes in one file
+
+[`episodes.py`](episodes.py) lists where the picture goes black and the sound goes
+quiet together, which is where one episode gives way to the next. So does an ad
+break, so `--sheet` draws the frames either side of each: end credits before and a
+title sequence after is a join, the same scene on both sides is a break.
+
+```
+./episodes.py "Series.mp4"                          # the candidate joins
+./episodes.py "Series.mp4" --sheet joins.jpg        # and the frames either side
+./episodes.py "Series.mp4" --cut 1320,2640,3960     # "Series - part 1.mp4" and so on
+```
+
+`--cut` copies the picture and sound without re-encoding, so each cut lands on the
+first keyframe it can use at or after the time given. It says where each part really
+begins, which can be a second or two into the next episode's titles. Cutting at an
+exact frame would mean re-encoding the few seconds around each join. It uses
+ffmpeg's segment muxer, because `-ss` with `-c copy` started the picture 2.5 s after
+the sound.
+
+Give each part a name or an `.nfo` your player reads as an episode.
